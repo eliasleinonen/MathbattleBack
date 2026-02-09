@@ -77,8 +77,8 @@ FastAPI Backend (Python 3.11)
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/Skriptiensolmija/mathbattlebackend.git
-cd mathbattlebackend
+git clone https://github.com/Skriptiensolmija/MathbattleBack.git
+cd MathbattleBack
 ```
 
 ### 2. Create Virtual Environment
@@ -218,12 +218,12 @@ Uses SymPy's symbolic math engine with multiple equivalence checks:
 
 ```
 .
-├── main.py                      # Main FastAPI application (2546 lines)
+├── main.py                      # Main FastAPI application
 ├── check_math_equiv.py          # Math equivalence testing utilities
 ├── seed_daily_challenges.py     # Daily challenge generation script
 ├── test_answer_checking.py      # Answer validation tests
 ├── requirements.txt             # Python dependencies
-├── runtime.txt                  # Python version (3.11.8)
+├── runtime.txt                  # Python version
 ├── Dockerfile                   # Container configuration
 ├── .env.example                 # Environment template
 ├── .gitignore                   # Git ignore rules
@@ -259,7 +259,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🔗 Related Projects
 
-- **Frontend Repository:** [Math Battle Frontend](https://github.com/Skriptiensolmija/mathbattlefront) *(if public)*
+- **Frontend Repository:** [Math Battle Frontend](https://github.com/Skriptiensolmija/mathbattlefront)
 
 ## 👨‍💻 Author
 
@@ -275,5 +275,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**⚠️ Note:** This is a portfolio project demonstrating full-stack development capabilities, real-time game mechanics, and production-ready API design.#   M a t h b a t t l e B a c k  
- 
+**⚠️ Note:** This is a portfolio project demonstrating full-stack development capabilities, real-time game mechanics, and production-ready API design.
