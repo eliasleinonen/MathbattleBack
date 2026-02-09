@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Virtual environments
+venv/
+ENV/
+.env/
+.venv/
+
+# Environment variables - CRITICAL: Never commit these!
+.env
+.env.local
+.env.*.local
+*.env
+.env.*
+
+# Allow the example file
+!.env.example
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Docker
+*.pid
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test
+coverage/
+htmlcov/
+
+# Misc
+*.sqlite3
+*.db
+*.bak
+*.swp
+*.swo
+
+# Ignore runtime.txt if not needed
+runtime.txt
