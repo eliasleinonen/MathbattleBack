@@ -2,7 +2,7 @@
 
 API for [Derivative Duel](https://mathbattle.xyz), a competitive 1v1 game where players race to solve derivative problems.
 
-Frontend: [eliasleinonen/mathbattlefront](https://github.com/eliasleinonen/mathbattlefront) (or your current frontend repo URL if different).
+Frontend: [eliasleinonen/mathbattlefront](https://github.com/eliasleinonen/mathbattlefront) 
 
 ## What it does
 
