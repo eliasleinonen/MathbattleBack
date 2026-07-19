@@ -69,6 +69,7 @@ def reset_game_state():
     main.in_memory_matches.clear()
     main.in_memory_rounds.clear()
     main.in_memory_users.clear()
+    main.match_locks.clear()
     main.matchmaking_queue.clear()
     main.cancelled_users.clear()
     main.time_trials.clear()
