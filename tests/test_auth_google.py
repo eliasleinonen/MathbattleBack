@@ -19,9 +19,13 @@ def google_configured(monkeypatch):
     def _fake_verify(token: str) -> dict:
         if token == "bad-token":
             raise ValueError("invalid token")
+        if token == "wrong-issuer":
+            raise main.GoogleAuthError("Wrong issuer.")
         if token == "no-email":
-            return {"name": "No Email"}
-        return {"email": "player@example.com", "name": "Test Player"}
+            return {"name": "No Email", "email_verified": True}
+        if token == "unverified-email":
+            return {"email": "player@example.com", "name": "Test Player", "email_verified": False}
+        return {"email": "player@example.com", "name": "Test Player", "email_verified": True}
 
     monkeypatch.setattr(main, "verify_google_token", _fake_verify)
 
@@ -82,8 +86,22 @@ def test_google_auth_rejects_invalid_token(client, google_configured):
     assert res.status_code == 401
 
 
+def test_google_auth_rejects_wrong_issuer(client, google_configured):
+    res = client.post("/api/auth/google", json={"token": "wrong-issuer"})
+    assert res.status_code == 401
+
+
 def test_google_auth_rejects_token_without_email(client, google_configured):
     res = client.post("/api/auth/google", json={"token": "no-email"})
+    assert res.status_code == 401
+
+
+def test_google_auth_rejects_unverified_email(client, google_configured, monkeypatch):
+    async def _insert_one(_doc):
+        raise AssertionError("must not create a user for an unverified email")
+
+    monkeypatch.setattr(main.users_collection, "insert_one", _insert_one)
+    res = client.post("/api/auth/google", json={"token": "unverified-email"})
     assert res.status_code == 401
 
 

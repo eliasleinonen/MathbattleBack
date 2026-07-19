@@ -15,6 +15,7 @@ from bson import ObjectId
 import random
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+from google.auth.exceptions import GoogleAuthError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -154,7 +155,8 @@ def verify_google_token(token: str) -> dict:
     Verify a Google ID token and return its claims.
 
     Isolated in its own function so tests can stub it without reaching Google.
-    Raises ValueError if the token is invalid (per the google-auth contract).
+    Raises ValueError (bad signature/audience/expiry) or GoogleAuthError
+    (wrong issuer) if the token is invalid, per the google-auth contract.
     """
     return id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
 
@@ -695,14 +697,20 @@ async def google_auth(auth_request: GoogleAuthRequest):
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=503, detail="Google login is not configured")
 
+    # google-auth raises ValueError for bad signature/audience/expiry and
+    # GoogleAuthError for a wrong issuer; both mean the token is untrustworthy.
     try:
         idinfo = verify_google_token(auth_request.token)
-    except ValueError:
+    except (ValueError, GoogleAuthError):
         raise HTTPException(status_code=401, detail="Invalid Google token")
 
     email = idinfo.get("email")
     if not email:
         raise HTTPException(status_code=401, detail="Google token is missing an email")
+
+    # Only trust an email Google has actually verified, since accounts are keyed by it.
+    if not idinfo.get("email_verified"):
+        raise HTTPException(status_code=401, detail="Google email is not verified")
 
     name = idinfo.get("name") or email.split("@")[0]
 
