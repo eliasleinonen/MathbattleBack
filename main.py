@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Union
 from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
+import asyncio
 import logging
 import os
 import secrets
@@ -83,6 +84,58 @@ daily_completions_storage = {}  # {(user_id, date): {"time": float, "correct": b
 user_counter = 0
 match_counter = 0
 round_counter = 0
+match_locks = {}  # {match_id: asyncio.Lock} - serializes round creation per match
+
+# How long (seconds) a player can go without polling before we treat them as
+# having left the match. The frontend polls status every 0.5s, so 12s covers
+# slow networks and short refreshes without false positives.
+PRESENCE_TIMEOUT_SECONDS = 12
+
+
+def utc_now() -> datetime:
+    """Timezone-aware current UTC time. Use for all round timing math."""
+    return datetime.now(timezone.utc)
+
+
+def ensure_utc(dt: datetime) -> datetime:
+    """Treat naive datetimes (Mongo/legacy docs) as UTC so aware/naive math never mixes."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def parse_round_start(raw) -> Optional[datetime]:
+    """Parse a round start timestamp that may be an ISO string or datetime."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            return ensure_utc(datetime.fromisoformat(raw))
+        except ValueError:
+            return None
+    return ensure_utc(raw)
+
+
+def get_match_lock(match_id: str) -> asyncio.Lock:
+    lock = match_locks.get(match_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        match_locks[match_id] = lock
+    return lock
+
+
+def mark_player_seen(match: dict, user_id) -> None:
+    match.setdefault("player_last_seen", {})[str(user_id)] = utc_now()
+
+
+def is_player_connected(match: dict, player_id) -> bool:
+    """A player counts as connected if they polled recently (or never had to yet)."""
+    if str(player_id) == "bot-opponent":
+        return True
+    last_seen = match.get("player_last_seen", {}).get(str(player_id))
+    if last_seen is None:
+        return True
+    return (utc_now() - ensure_utc(last_seen)).total_seconds() <= PRESENCE_TIMEOUT_SECONDS
 
 # Pre-generate 100 daily challenges
 def initialize_daily_challenges():
@@ -1294,13 +1347,8 @@ async def get_match_by_code(match_code: str, current_user = Depends(get_current_
 
 @app.get("/api/game/question")
 async def get_question(match_id: str, current_user = Depends(get_current_user)):
-    global round_counter
-    
-    
-
     match = in_memory_matches.get(match_id)
 
-    
     if not match:
         # Try to load from database
         match = await matches_collection.find_one({"_id": match_id})
@@ -1311,71 +1359,75 @@ async def get_question(match_id: str, current_user = Depends(get_current_user)):
     user_id = str(current_user["_id"])
     if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
         raise HTTPException(status_code=403, detail="Not your match")
+    mark_player_seen(match, user_id)
 
-    
     # Check if match is already completed
     if match.get("status") == "completed":
         raise HTTPException(status_code=400, detail="Match is already completed")
-    
-    # Check if there's already a current round
-    current_round_id = match.get("current_round_id")
-    if current_round_id and current_round_id in in_memory_rounds:
-        round_doc = in_memory_rounds[current_round_id]
-        # Check for timeout (5 minutes)
-        if not round_doc.get("winner_id"):
-            round_start = round_doc.get("created_at")
-            if round_start:
-                elapsed = (datetime.utcnow() - round_start).total_seconds()
-                if elapsed > 300:  # 5 minutes
-                    # Mark round as tie and clear it
-                    round_doc["winner_id"] = "tie"
-                    in_memory_rounds[current_round_id] = round_doc
-                    await rounds_collection.update_one(
-                        {"_id": current_round_id},
-                        {"$set": {"winner_id": "tie"}}
-                    )
-                    # Update match rounds array with tie result
-                    await matches_collection.update_one(
-                        {"_id": match_id, "rounds.round_number": round_doc["round_number"]},
-                        {"$set": {"rounds.$.winner": "tie"}}
-                    )
-                    # Continue to create new round
-                else:
-                    # Return existing question if round not won yet and not timed out
-                    return {
+
+    # Serialize round lookup/creation per match: after a round ends, both
+    # clients request the next question at nearly the same time. Without the
+    # lock each request created its own round and the players ended up on
+    # different questions.
+    async with get_match_lock(match_id):
+        match = in_memory_matches.get(match_id, match)
+
+        # Check if there's already a current round
+        current_round_id = match.get("current_round_id")
+        if current_round_id and current_round_id in in_memory_rounds:
+            round_doc = in_memory_rounds[current_round_id]
+            if not round_doc.get("winner_id"):
+                round_start = parse_round_start(round_doc.get("created_at"))
+                timed_out = (
+                    round_start is not None
+                    and (utc_now() - round_start).total_seconds() > 300  # 5 minutes
+                )
+                if not timed_out:
+                    # Round still in progress - both players get the same question
+                    response = {
                         "round_id": current_round_id,
                         "expression": round_doc["question"],
                         "evaluate_at": round_doc["evaluate_at"],
-                        "round_start_time": match.get("round_start_time")
+                        "ask_for_derivative_only": round_doc.get("ask_for_derivative_only", True),
+                        "round_start_time": match.get("round_start_time"),
                     }
-            else:
-                # No start time, return existing question
-                return {
-                    "round_id": current_round_id,
-                    "expression": round_doc["question"],
-                    "evaluate_at": round_doc["evaluate_at"],
-                    "round_start_time": match.get("round_start_time")
-                }
-    
-    # Get average ELO
-    avg_elo = (match["player1_elo"] + match["player2_elo"]) / 2
-    
+                    if "time_limit" in round_doc:
+                        response["time_limit"] = round_doc["time_limit"]
+                    return response
+
+                # Timed out - mark round as tie, then fall through to create a new one
+                round_doc["winner_id"] = "tie"
+                in_memory_rounds[current_round_id] = round_doc
+                await rounds_collection.update_one(
+                    {"_id": current_round_id},
+                    {"$set": {"winner_id": "tie"}}
+                )
+                await matches_collection.update_one(
+                    {"_id": match_id, "rounds.round_number": round_doc["round_number"]},
+                    {"$set": {"rounds.$.winner": "tie"}}
+                )
+
+        return await _create_next_round(match_id, match)
+
+
+async def _create_next_round(match_id: str, match: dict) -> dict:
+    """Create the next round for a match. Caller must hold the match lock."""
     # Use the LOWER ELO to ensure both players see the same difficulty question
     lower_elo = min(match["player1_elo"], match["player2_elo"])
-    
-    # Generate question based on lower ELO
     question = generate_question(lower_elo)
-    
+
     # Count rounds for this match
     round_count = len([r for r in in_memory_rounds.values() if r["match_id"] == match_id])
-    
-    # Set round start time for synchronization (3 seconds from now)
-    round_start_time = datetime.utcnow() + timedelta(seconds=3)
+
+    # Set round start time for synchronization (3 seconds from now).
+    # Timezone-aware so the ISO string carries an offset and browsers in any
+    # timezone parse it as the correct instant.
+    round_start_time = utc_now() + timedelta(seconds=3)
     in_memory_matches[match_id]["round_start_time"] = round_start_time.isoformat()
-    
-    # Create round
-    round_counter += 1
-    round_id = f"round-{round_counter}"
+
+    # Deterministic per-match round id so a retried/duplicated creation cannot
+    # fork the match into two different "current" rounds.
+    round_id = f"round-{match_id}-{round_count + 1}"
     round_doc = {
         "_id": round_id,
         "match_id": match_id,
@@ -1473,6 +1525,7 @@ async def give_up_round(match_id: str, current_user = Depends(get_current_user))
     user_id = str(current_user["_id"])
     if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
         raise HTTPException(status_code=403, detail="Not your match")
+    mark_player_seen(match, user_id)
 
     round_id = match.get("current_round_id")
     if not round_id:
@@ -1510,9 +1563,14 @@ async def give_up_round(match_id: str, current_user = Depends(get_current_user))
     
     # Check if this is a bot match - bot automatically gives up too
     is_bot_match = match.get("match_type") == "random" and match["player2_id"] == "bot-opponent"
-    
-    if is_bot_match:
-        # Bot automatically gives up when player gives up
+
+    # If the opponent stopped polling (closed the tab, lost connection), treat
+    # their give-up as automatic so the remaining player can advance instead of
+    # waiting forever for someone who left.
+    opponent_id = match["player2_id"] if is_player1 else match["player1_id"]
+    opponent_left = not is_player_connected(match, opponent_id)
+
+    if is_bot_match or opponent_left:
         round_doc["player1_gave_up"] = True
         round_doc["player2_gave_up"] = True
         in_memory_rounds[round_id] = round_doc
@@ -1570,6 +1628,7 @@ async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_u
     user_id = str(current_user["_id"])
     if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
         raise HTTPException(status_code=403, detail="Not your match")
+    mark_player_seen(match, user_id)
 
     # Check if match is already completed - prevent processing answers after match ends
     if match.get("status") == "completed":
@@ -1607,11 +1666,8 @@ async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_u
     if is_bot_match and "time_limit" in round_doc:
         # Use the synced round start time if available; fall back to created_at
         round_start_raw = match.get("round_start_time") or round_doc.get("started_at") or round_doc.get("created_at")
-        try:
-            round_start = datetime.fromisoformat(round_start_raw) if isinstance(round_start_raw, str) else round_start_raw
-        except Exception:
-            round_start = round_doc.get("created_at", datetime.utcnow())
-        now = datetime.utcnow()
+        round_start = parse_round_start(round_start_raw) or parse_round_start(round_doc.get("created_at")) or utc_now()
+        now = utc_now()
         elapsed_time = (now - round_start).total_seconds()
         
         # If time limit exceeded, user loses the round
@@ -1831,7 +1887,7 @@ async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_u
         bot_time = random.uniform(bot_min, bot_max)
 
         # For realism, store the time user took to answer (if not already present)
-        now = datetime.utcnow()
+        now = utc_now()
         if is_player1:
             user_time_field = "player1_answer_time"
         else:
@@ -1846,10 +1902,7 @@ async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_u
 
         # Use synchronized round start time for fair bot timing
         round_start_raw = match.get("round_start_time") or round_doc.get("started_at") or round_doc.get("created_at")
-        try:
-            round_start = datetime.fromisoformat(round_start_raw) if isinstance(round_start_raw, str) else round_start_raw
-        except Exception:
-            round_start = round_doc.get("created_at", now)
+        round_start = parse_round_start(round_start_raw) or now
         user_time = max(0.0, (now - round_start).total_seconds())
 
         if not bot_correct:
@@ -1966,10 +2019,18 @@ async def get_game_status(match_id: str, current_user = Depends(get_current_user
         match = await matches_collection.find_one({"_id": match_id})
         if not match:
             raise HTTPException(status_code=404, detail="Match not found")
+        # Cache so presence tracking below survives across polls
+        in_memory_matches[match_id] = match
     
     user_id = str(current_user["_id"])
     if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
         raise HTTPException(status_code=403, detail="Not your match")
+
+    # Presence: each poll is a heartbeat; the opponent is "connected" while
+    # their last heartbeat is recent enough.
+    mark_player_seen(match, user_id)
+    opponent_id = match["player2_id"] if user_id == str(match["player1_id"]) else match["player1_id"]
+    opponent_connected = is_player_connected(match, opponent_id)
 
     # Get current round info if exists
     current_round_id = match.get("current_round_id")
@@ -2007,7 +2068,8 @@ async def get_game_status(match_id: str, current_user = Depends(get_current_user
         "round_winner": round_winner,
         "round_start_time": match.get("round_start_time"),
         "player1_gave_up": player1_gave_up,
-        "player2_gave_up": player2_gave_up
+        "player2_gave_up": player2_gave_up,
+        "opponent_connected": opponent_connected
     }
 
 
