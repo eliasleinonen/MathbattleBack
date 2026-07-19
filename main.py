@@ -677,6 +677,13 @@ async def startup_event():
 async def root():
     return {"message": "Derivative Duel API"}
 
+
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def health():
+    """Liveness check for uptime monitors (GET and HEAD)."""
+    return {"status": "ok"}
+
+
 @app.get("/api/server-time")
 async def get_server_time():
     """Return the server's current date/time in UTC"""
