@@ -3,11 +3,13 @@ from sympy import sympify, simplify, Symbol, sqrt
 from sympy.core.sympify import SympifyError
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List, Union
 from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
+import logging
 import os
 import secrets
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -49,6 +51,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+logger = logging.getLogger("derivative_duel")
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    Catch-all for uncaught errors so clients never see stack traces or internal
+    messages. The full error is logged server-side; the client gets a generic text.
+    Explicit HTTPExceptions are handled by FastAPI and keep their own detail.
+    """
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Something went wrong. Please try again."},
+    )
 
 # Security
 security = HTTPBearer(auto_error=False)
@@ -2383,6 +2401,9 @@ async def get_daily_leaderboard(current_user: dict = Depends(get_current_user)):
             if date == today and data.get("correct", False)
         ]
     
+    # Guard against legacy rows that stored a missing time; treat them as slowest
+    # rather than crashing the sort on a None value.
+    completions = [c for c in completions if c.get("time") is not None]
     completions.sort(key=lambda x: x["time"])
     completions = completions[:10]
     
@@ -2454,6 +2475,7 @@ async def get_daily_history(current_user: dict = Depends(get_current_user)):
         
         winner_username = None
         best_time = None
+        date_completions = [c for c in date_completions if c.get("time") is not None]
         if date_completions:
             date_completions.sort(key=lambda x: x["time"])
             winner = date_completions[0]
@@ -2482,8 +2504,22 @@ async def submit_daily_challenge(
     """Submit answer for today's daily challenge"""
     data = await request.json()
     user_answer = data.get("answer")
-    time_taken = data.get("time") or data.get("time_taken")
-    
+
+    # Resolve the time value, accepting either "time" or "time_taken".
+    # Use an explicit None check so a legitimate 0 is not discarded.
+    raw_time = data.get("time")
+    if raw_time is None:
+        raw_time = data.get("time_taken")
+
+    # A valid, non-negative number is required. Storing None here would later
+    # crash the rank comparison and leaderboard sort for every other player.
+    try:
+        time_taken = float(raw_time)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="A numeric time is required")
+    if time_taken < 0:
+        raise HTTPException(status_code=400, detail="Time cannot be negative")
+
     print(f"[DEBUG] Submit: user={current_user['_id']}, time={time_taken}, answer={user_answer}")
     
     # Always use today's date (server-side)
