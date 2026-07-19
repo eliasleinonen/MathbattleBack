@@ -182,3 +182,78 @@ dedicated tests also pin what happens when the DB misses.
 - **`tests/conftest.py` does not stub `delete_one`**, so any test that
   reaches `cancel_challenge` with the stock mocks would hit a real Motor
   call; the fake collection in the challenge test file covers it.
+
+## Answer submission, scoring and win conditions (`/api/game/answer`, `/api/game/give-up`, first-to-3)
+
+Findings from `tests/test_match_answer_and_scoring_edge_cases.py` (67 tests:
+66 pass, 1 strict `xfail` documenting a real bug). Friend matches are used
+for controlled 1v1; the ranked queue and the bot fallback are exercised where
+the code paths differ.
+
+### Bugs (xfail or explicitly demonstrated)
+
+1. **Double-score race when the round is re-read from the DB** —
+   `test_concurrent_correct_answers_via_db_reload_only_one_scores` (xfail).
+   `submit_answer` takes no match lock (unlike `get_question`). When the
+   round doc is in `in_memory_rounds` the winner check and winner write run
+   with no await between them, so concurrent correct answers serialize and
+   only one player scores (pinned by
+   `test_concurrent_correct_answers_in_memory_only_one_scores`). But on a
+   memory miss the round is loaded via `await rounds_collection.find_one`,
+   and each request gets its own copy of the doc. Two players answering
+   correctly at the same time both pass the `winner_id` check on their
+   private copies, both are declared round winner, and **one round pays out
+   a point to each player (1-1)**, with both responses claiming
+   `correct: true` and `round_winner: <self>`. Current behavior is pinned by
+   `test_current_behavior_db_reload_race_double_scores_one_round`. Any
+   multi-worker deployment (or cache eviction/restart) hits this path.
+
+### Quirks / current behavior worth knowing (asserted in passing tests)
+
+- **`already_won` responses report `correct: false` unconditionally**, even
+  when the late submission is mathematically right — the answer is never
+  graded once the round has a winner. Clients must key off `already_won`,
+  not `correct`.
+- **Giving up does not lock a player out of the round.** Until the opponent
+  also gives up, the quitter can still submit a correct answer and win the
+  round (`test_player_who_gave_up_can_still_answer_and_win_round`). A lone
+  give-up returns `{"status": "gave_up", "waiting_for_opponent": true}` and
+  the round stays open; both giving up ties the round (`winner_id: "tie"`,
+  no score change) and the next `/question` starts a fresh round. If the
+  opponent's presence heartbeat is stale (>12s), a lone give-up auto-ties.
+- **A finished round stays "current" until someone GETs `/question` again**;
+  answers in that window get `already_won` echoes rather than starting the
+  next round. Round ids progress deterministically
+  (`round-<match>-1,2,3…`) with `round_number` incrementing.
+- **Boolean answers slip through validation.** `AnswerSubmit.answer` is
+  `Union[str, float]`, so JSON `true` is coerced to `1.0` and graded as an
+  answer (wrong), while `null`, arrays and objects are 422s. Empty and
+  whitespace-only strings reach SymPy, raise inside the try/except, and are
+  graded wrong (no 500). Same for 5000-char garbage and exotic unicode
+  (fullwidth `２ｘ`, math-alphanumeric `𝟐𝐱`, `٢x`).
+- **Unicode operator handling is inconsistent with the daily-challenge
+  checker.** `submit_answer`'s inline preprocess maps `·` but not `×`, while
+  the standalone `check_math_equivalence` (used elsewhere) maps both — so
+  `2×x` is wrong in PvP but would pass a daily challenge.
+- **Equivalence grading is generous**: `2*x`, `2x`, `x+x`, `2 x`, `x*2`,
+  `2·x`, `2.0*x`, `4*x/2`, `2*x + 0` and `(2)(x)` are all accepted for
+  `2·x`; near-misses (`2`, `x`, `-2*x`, `2*x + 1`, `x^2`) are rejected. The
+  numeric-expected branch compares with `abs(diff) < 0.1` tolerance.
+- **Waiting (unjoined) matches don't block answers by status** — the creator
+  just gets `404 "No active round"`, and the same 404 covers an active match
+  where nobody requested a question yet. Unknown match ids 404, outsiders
+  403 (their "correct" answers never score), completed matches 400 on both
+  `/answer` and `/question`.
+- **Win conditions behave**: first to 3 completes the match at exactly 3-0,
+  3-1 or 3-2 (2-2 keeps it active), symmetrically for player1 and player2,
+  freezing scores and setting `status: "completed"` + `winner_id`, which the
+  status poller reflects.
+- **ELO only moves for `match_type` in `{"random", "ranked"}`**: friend-match
+  completion writes `elo_change: 0` and touches no user docs; ranked
+  completion applies `calculate_elo_change` symmetrically (+elo/+1 win,
+  −elo/+1 loss). Mid-match round wins never move ELO.
+- **Bot rounds are timed; human rounds are not.** Exceeding the bot round's
+  `time_limit` forfeits the round to the bot even if the submitted answer is
+  correct (`already_won: true`, `message: "Time limit exceeded"`); three
+  timeouts lose the match, set `winner_id: "bot-opponent"`, and deduct ELO
+  from the human (loss recorded), after which further answers are 400.
