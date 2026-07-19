@@ -3,12 +3,14 @@ from sympy import sympify, simplify, Symbol, sqrt
 from sympy.core.sympify import SympifyError
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Union
 from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+import logging
 import os
 import secrets
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -50,6 +52,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+logger = logging.getLogger("derivative_duel")
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    Catch-all for uncaught errors so clients never see stack traces or internal
+    messages. The full error is logged server-side; the client gets a generic text.
+    Explicit HTTPExceptions are handled by FastAPI and keep their own detail.
+    """
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Something went wrong. Please try again."},
+    )
 
 # Security
 security = HTTPBearer(auto_error=False)
