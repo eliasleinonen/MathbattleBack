@@ -5,20 +5,19 @@ from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional, List, Union
 from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 import logging
 import os
 import secrets
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import random
-# OAuth temporarily disabled for demo - guests can play without login
-# from google.oauth2 import id_token
-# from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+from google.auth.exceptions import GoogleAuthError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,11 +28,11 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 MONGODB_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
 DATABASE_NAME = "derivative_duel"
-# OAuth disabled for demo - all players play as guests
-# GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
-# GOOGLE_CLIENT_SECRET = os.getenv("OAUTH", "")
+# Google OAuth: sign-in and daily challenges require this to be set in the environment.
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
-print(f"[DEMO MODE] Authentication disabled - all players are guests")
+if not GOOGLE_CLIENT_ID:
+    print("[WARNING] GOOGLE_CLIENT_ID is not set - Google login and daily challenges will be unavailable")
 
 # Initialize FastAPI
 app = FastAPI(title="Derivative Duel API")
@@ -71,7 +70,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 # Security
 security = HTTPBearer(auto_error=False)
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # In-memory storage (will be replaced with MongoDB)
 in_memory_users = {}
@@ -128,17 +126,6 @@ daily_completions_collection = db.DailyChallengeCompletion
 
 
 # Models
-class UserCreate(BaseModel):
-    email: EmailStr
-    password: str
-    name: str
-
-
-class UserLogin(BaseModel):
-    email: EmailStr
-    password: str
-
-
 class Token(BaseModel):
     access_token: str
     token_type: str
@@ -181,12 +168,15 @@ class SetUsernameRequest(BaseModel):
 
 
 # Helper functions
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+def verify_google_token(token: str) -> dict:
+    """
+    Verify a Google ID token and return its claims.
 
-
-def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    Isolated in its own function so tests can stub it without reaching Google.
+    Raises ValueError (bad signature/audience/expiry) or GoogleAuthError
+    (wrong issuer) if the token is invalid, per the google-auth contract.
+    """
+    return id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
 
 
 def create_access_token(data: dict) -> str:
@@ -713,45 +703,49 @@ async def get_server_time():
     }
 
 
-@app.post("/auth/register", response_model=Token)
-async def register(user: UserCreate):
-    global user_counter
-    # Check if user exists
-    if user.email in in_memory_users:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    # Create user
-    user_counter += 1
-    user_id = f"user-{user_counter}"
-    in_memory_users[user.email] = {
-        "_id": user_id,
-        "email": user.email,
-        "password": get_password_hash(user.password),
-        "name": user.name,
-        "elo": 500,
-        "wins": 0,
-        "losses": 0,
-        "created_at": datetime.utcnow()
-    }
-    
-    # Create token
-    access_token = create_access_token({"sub": user.email})
+@app.post("/api/auth/google", response_model=Token)
+async def google_auth(auth_request: GoogleAuthRequest):
+    """
+    Log in or register with a Google ID token.
+
+    This is the only account-based sign-in path; there is no email/password auth.
+    On success we upsert the user in MongoDB and issue our own JWT keyed by email,
+    which get_current_user then resolves back to the stored user.
+    """
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google login is not configured")
+
+    # google-auth raises ValueError for bad signature/audience/expiry and
+    # GoogleAuthError for a wrong issuer; both mean the token is untrustworthy.
+    try:
+        idinfo = verify_google_token(auth_request.token)
+    except (ValueError, GoogleAuthError):
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+
+    email = idinfo.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="Google token is missing an email")
+
+    # Only trust an email Google has actually verified, since accounts are keyed by it.
+    if not idinfo.get("email_verified"):
+        raise HTTPException(status_code=401, detail="Google email is not verified")
+
+    name = idinfo.get("name") or email.split("@")[0]
+
+    # Upsert: create the user on first sign-in, otherwise keep their existing record.
+    user = await users_collection.find_one({"email": email})
+    if user is None:
+        await users_collection.insert_one({
+            "email": email,
+            "name": name,
+            "elo": 1000,
+            "wins": 0,
+            "losses": 0,
+            "created_at": datetime.now(timezone.utc),
+        })
+
+    access_token = create_access_token({"sub": email})
     return {"access_token": access_token, "token_type": "bearer"}
-
-
-@app.post("/auth/login", response_model=Token)
-async def login(credentials: UserLogin):
-    user = in_memory_users.get(credentials.email)
-    if not user or not verify_password(credentials.password, user["password"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    access_token = create_access_token({"sub": credentials.email})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-# OAuth disabled for demo mode - all players are guests
-# @app.post("/auth/google", response_model=Token)
-# async def google_auth(auth_request: GoogleAuthRequest):
-#     raise HTTPException(status_code=501, detail="OAuth disabled in demo mode")
 
 
 
