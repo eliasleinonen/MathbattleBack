@@ -288,7 +288,9 @@ def random_poly_easy():
         expr = f"{a}·x^2 {format_term(b, '·x')} {format_term(c)}"
         deriv = f"{2*a}·x {format_term(b)}"
         expressions.append((expr, deriv))
-    
+
+    if not expressions:
+        return ("2·x^2 + 4·x + 6", "4·x + 4")
     return random.choice(expressions)
 
 def random_poly_medium():
@@ -1044,8 +1046,8 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
     
     # If found opponent, create match
     if opponent_id:
-        opponent = await users_collection.find_one({"_id": ObjectId(opponent_id)})
-        
+        result = (await users_collection.find_one({"_id": ObjectId(opponent_id)})) if ObjectId.is_valid(opponent_id) else {"_id": opponent_id, "elo": 1000}
+        opponent = result or {"_id": opponent_id, "elo": 1000}
         # Remove both from queue
         matchmaking_queue.pop(user_id, None)
         matchmaking_queue.pop(opponent_id, None)
@@ -1275,7 +1277,11 @@ async def get_match_by_code(match_code: str, current_user = Depends(get_current_
 async def get_question(match_id: str, current_user = Depends(get_current_user)):
     global round_counter
     
+    
+
     match = in_memory_matches.get(match_id)
+
+    
     if not match:
         # Try to load from database
         match = await matches_collection.find_one({"_id": match_id})
@@ -1283,6 +1289,10 @@ async def get_question(match_id: str, current_user = Depends(get_current_user)):
             in_memory_matches[match_id] = match
         else:
             raise HTTPException(status_code=404, detail="Match not found")
+    user_id = str(current_user["_id"])
+    if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
+        raise HTTPException(status_code=403, detail="Not your match")
+
     
     # Check if match is already completed
     if match.get("status") == "completed":
@@ -1432,6 +1442,8 @@ async def get_question(match_id: str, current_user = Depends(get_current_user)):
 async def give_up_round(match_id: str, current_user = Depends(get_current_user)):
     """Mark that player wants to give up current round"""
     match = in_memory_matches.get(match_id)
+
+    
     if not match:
         match = await matches_collection.find_one({"_id": match_id})
         if match:
@@ -1439,6 +1451,10 @@ async def give_up_round(match_id: str, current_user = Depends(get_current_user))
         else:
             raise HTTPException(status_code=404, detail="Match not found")
     
+    user_id = str(current_user["_id"])
+    if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
+        raise HTTPException(status_code=403, detail="Not your match")
+
     round_id = match.get("current_round_id")
     if not round_id:
         raise HTTPException(status_code=404, detail="No active round")
@@ -1456,7 +1472,7 @@ async def give_up_round(match_id: str, current_user = Depends(get_current_user))
         return {"status": "already_ended", "round_winner": str(round_doc["winner_id"])}
     
     # Determine if this is player1 or player2
-    is_player1 = current_user["_id"] == match["player1_id"]
+    is_player1 = str(current_user["_id"]) == str(match["player1_id"])
     give_up_field = "player1_gave_up" if is_player1 else "player2_gave_up"
     
     # Mark player as gave up
@@ -1520,6 +1536,9 @@ async def give_up_round(match_id: str, current_user = Depends(get_current_user))
 @app.post("/api/game/answer")
 async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_user)):
     match = in_memory_matches.get(data.match_id)
+
+    
+
     if not match:
         # Try to find in database
         match = await matches_collection.find_one({"_id": data.match_id})
@@ -1529,6 +1548,10 @@ async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_u
         else:
             raise HTTPException(status_code=404, detail="Match not found")
     
+    user_id = str(current_user["_id"])
+    if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
+        raise HTTPException(status_code=403, detail="Not your match")
+
     # Check if match is already completed - prevent processing answers after match ends
     if match.get("status") == "completed":
         raise HTTPException(status_code=400, detail="Match is already completed")
@@ -1726,7 +1749,7 @@ async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_u
             correct = False
     
     # Determine if this is against bot
-    is_player1 = current_user["_id"] == match["player1_id"]
+    is_player1 = str(current_user["_id"]) == str(match["player1_id"])
     is_bot_match = match.get("match_type") == "random" and match.get("player2_id") == "bot-opponent"
     
     # If incorrect, allow retry - don't end the round
@@ -1838,16 +1861,16 @@ async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_u
     player1_score = match["player1_score"]
     player2_score = match["player2_score"]
     
-    if round_winner == match["player1_id"]:
+    if str(round_winner) == str(match["player1_id"]):
         player1_score += 1
-    elif round_winner == match["player2_id"]:
+    elif str(round_winner) == str(match["player2_id"]):
         player2_score += 1
     
     in_memory_matches[data.match_id]["player1_score"] = player1_score
     in_memory_matches[data.match_id]["player2_score"] = player2_score
     
     # Update match rounds array with winner and answers
-    winner_name = "player1" if round_winner == match["player1_id"] else "player2" if round_winner == match["player2_id"] else "tie"
+    winner_name = "player1" if str(round_winner) == str(match["player1_id"]) else "player2" if str(round_winner) == str(match["player2_id"]) else "tie"
     await matches_collection.update_one(
         {"_id": data.match_id, "rounds.round_number": round_doc["round_number"]},
         {"$set": {
@@ -1925,6 +1948,10 @@ async def get_game_status(match_id: str, current_user = Depends(get_current_user
         if not match:
             raise HTTPException(status_code=404, detail="Match not found")
     
+    user_id = str(current_user["_id"])
+    if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
+        raise HTTPException(status_code=403, detail="Not your match")
+
     # Get current round info if exists
     current_round_id = match.get("current_round_id")
     round_winner = None
