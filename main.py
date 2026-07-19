@@ -1345,6 +1345,20 @@ async def get_match_by_code(match_code: str, current_user = Depends(get_current_
     raise HTTPException(status_code=404, detail="Match not found")
 
 
+def _question_response(round_id: str, round_doc: dict, round_start_time) -> dict:
+    """Client-facing question payload; shared by resume and creation paths."""
+    response = {
+        "round_id": round_id,
+        "expression": round_doc["question"],
+        "evaluate_at": round_doc["evaluate_at"],
+        "ask_for_derivative_only": round_doc.get("ask_for_derivative_only", True),
+        "round_start_time": round_start_time,
+    }
+    if "time_limit" in round_doc:
+        response["time_limit"] = round_doc["time_limit"]
+    return response
+
+
 @app.get("/api/game/question")
 async def get_question(match_id: str, current_user = Depends(get_current_user)):
     match = in_memory_matches.get(match_id)
@@ -1384,16 +1398,9 @@ async def get_question(match_id: str, current_user = Depends(get_current_user)):
                 )
                 if not timed_out:
                     # Round still in progress - both players get the same question
-                    response = {
-                        "round_id": current_round_id,
-                        "expression": round_doc["question"],
-                        "evaluate_at": round_doc["evaluate_at"],
-                        "ask_for_derivative_only": round_doc.get("ask_for_derivative_only", True),
-                        "round_start_time": match.get("round_start_time"),
-                    }
-                    if "time_limit" in round_doc:
-                        response["time_limit"] = round_doc["time_limit"]
-                    return response
+                    return _question_response(
+                        current_round_id, round_doc, match.get("round_start_time")
+                    )
 
                 # Timed out - mark round as tie, then fall through to create a new one
                 round_doc["winner_id"] = "tie"
@@ -1440,7 +1447,7 @@ async def _create_next_round(match_id: str, match: dict) -> dict:
         "player1_answer": None,
         "player2_answer": None,
         "winner_id": None,
-        "created_at": datetime.utcnow()
+        "created_at": utc_now()
     }
     # If this is a bot match, calculate time_limit based on user ELO
     is_bot_match = match.get("match_type") == "random" and match["player2_id"] == "bot-opponent"
@@ -1495,18 +1502,7 @@ async def _create_next_round(match_id: str, match: dict) -> dict:
         }
     )
     
-    response = {
-        "round_id": round_id,
-        "expression": question["expression"],
-        "evaluate_at": question["evaluate_at"],
-        "ask_for_derivative_only": question.get("ask_for_derivative_only", True),
-        "round_start_time": round_start_time.isoformat()
-    }
-    
-    if time_limit is not None:
-        response["time_limit"] = time_limit
-    
-    return response
+    return _question_response(round_id, round_doc, round_start_time.isoformat())
 
 
 @app.post("/api/game/give-up")
