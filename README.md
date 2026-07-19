@@ -52,6 +52,12 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8080
 
 API docs: `http://localhost:8080/docs`
 
+Liveness (for uptime pingers; supports GET and HEAD):
+
+```bash
+curl -I http://localhost:8080/health
+```
+
 ## Tests
 
 ```bash
