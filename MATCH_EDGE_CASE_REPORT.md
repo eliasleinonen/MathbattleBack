@@ -65,3 +65,120 @@ the production code compares against.
 - **Self-match is impossible** via double-polling: the queue scan skips the
   caller's own entry, and queue entries are fully removed after a successful
   match.
+
+## Friend matches (`/api/game/friend/create|join|status`, `/api/game/match/{code}`)
+
+Findings from `tests/test_friend_match_edge_cases.py` (45 tests: 43 pass,
+2 strict `xfail` documenting real bugs).
+
+### Bugs (xfail or explicitly demonstrated)
+
+1. **Match-code uniqueness ignores in-memory matches** —
+   `test_match_codes_unique_even_when_rng_repeats` (xfail).
+   `create_friend_match` only loops on `matches_collection.find_one` to check
+   for a code collision. Matches held in `in_memory_matches` are never
+   consulted, so when the DB is empty or unavailable two live matches can
+   share the same 6-char code. The companion test
+   `test_colliding_codes_shadow_the_second_match_on_join` shows the fallout:
+   the join scan resolves the code to whichever match was created first, so
+   the second match becomes permanently unreachable by code.
+
+2. **Concurrent-join race (no per-match lock)** —
+   `test_concurrent_joins_with_db_latency_both_succeed`.
+   `join_friend_match` does check-then-set with no `get_match_lock` (unlike
+   `get_question`, which was already fixed for the round-fork race). When the
+   match document is served from the DB with any latency, two players can
+   both read `status == "waiting"`, both get a 200, and the second writer
+   silently overwrites `player2_id` — the first acknowledged joiner is kicked
+   out of the match. The purely in-memory path happens to be atomic on the
+   event loop (`test_sequential_like_concurrent_joins_without_db_reject_second`),
+   so the race only bites when the DB lookup is involved.
+
+3. **Code lookup case-sensitivity is inconsistent** —
+   `test_get_match_by_code_accepts_lowercase_code` (xfail).
+   `/api/game/friend/join` and `/api/game/friend/status/{code}` normalize the
+   code with `.upper()`, but `/api/game/match/{match_code}` compares
+   case-sensitively, so a lowercase code that works everywhere else 404s
+   there.
+
+### Quirks / current behavior worth knowing (asserted in passing tests)
+
+- **Join is not idempotent.** Once player 2 has joined, a retried join by the
+  *same* player gets `400 "Match already started"`; clients must not retry.
+- **Misleading error for finished matches.** Joining a `completed` or
+  `abandoned` match also returns `"Match already started"`.
+- **Unknown `opponent_username` degrades silently.** If the username does not
+  resolve, the creator gets a plain `waiting` code match with **no error**,
+  and the bogus name is still stored in `player2_username`. A later join by
+  code updates `player2_id`/`player2_elo`/`status` but never refreshes
+  `player2_username`, so the stale name survives into the active match.
+- **Challenge username lookup is case-sensitive** (exact Mongo `find_one`):
+  `"beekeeper"` does not match `"BeeKeeper"` and silently falls back to an
+  open waiting match instead of a pending challenge.
+- **Pending challenges cannot be joined by code** — not even by the invited
+  player, who must use `/api/challenges/accept`; the code path answers
+  `400 "Match already started"`.
+- **Codes are upper-cased but never trimmed**: a pasted code with surrounding
+  whitespace 404s.
+- **The unauthenticated poller** `/api/game/friend/status/{code}` exposes
+  exactly `{match_id, status, player1_ready, player2_ready}` for any code,
+  waiting or active; for a pending challenge both ready flags are `True`
+  while status is still `pending`.
+- **`/api/game/match/{code}` on a waiting match returns the string `"None"`**
+  for `player2_id` (`str(None)`), which clients must special-case. Guest
+  opponents are labelled `"Guest"`; only players in the match may call it
+  (outsiders get 403).
+
+## Challenges (`/api/challenges/pending|accept/{id}|cancel/{id}`)
+
+Findings from `tests/test_challenge_match_edge_cases.py` (30 tests: 29 pass,
+1 strict `xfail`). Because all three challenge endpoints read only from the
+DB, most tests run against an in-process fake of `matches_collection`;
+dedicated tests also pin what happens when the DB misses.
+
+### Bugs (xfail or explicitly demonstrated)
+
+1. **Self-challenge is allowed** — `test_challenge_to_self_should_be_rejected`
+   (xfail). Creating a match with your own username yields a pending
+   challenge where `player1_id == player2_id`; it appears in your own pending
+   list and you can accept it (`test_challenge_to_self_is_allowed_and_self_acceptable`).
+   The join path explicitly rejects joining your own match; create does not.
+
+2. **Pending challenges are playable without accepting** —
+   `test_unaccepted_challenge_is_already_playable`. Gameplay routes
+   (`/api/game/question`, `/api/game/answer`) only reject `completed`
+   matches, never `pending` ones, so both parties can fetch questions and
+   score points on a challenge that was never accepted, bypassing the accept
+   step entirely.
+
+3. **No in-memory fallback (inconsistent with the friend endpoints)** —
+   `test_pending_listing_misses_memory_only_challenges` and
+   `test_accept_misses_memory_only_challenge`. `join_friend_match` and
+   `get_match_status` fall back to `in_memory_matches` on a DB miss, but
+   `get_pending_challenges` / `accept_challenge` / `cancel_challenge` query
+   the DB only. With the DB unavailable, a pending challenge that exists in
+   memory is invisible to the invitee and 404s on accept — even though the
+   same match *can* still be played (bug 2) and polled by code.
+
+### Quirks / current behavior worth knowing (asserted in passing tests)
+
+- **Accept/cancel authorization is correct**: only the invitee (exact
+  `player2_id`) may accept (403 otherwise, including the creator), and only
+  the creator may cancel (403 for the invitee and outsiders).
+- **Cancel deletes the document**, so a late accept — or a second cancel —
+  gets `404 "Challenge not found"` rather than a "was cancelled" message.
+- **Cancel doubles as "delete my unshared friend match"**: it accepts status
+  `waiting` as well as `pending`, and the code is dead (404) afterwards.
+- **Accepting twice** returns `400 "Challenge already accepted or expired"`;
+  the same 400 covers `abandoned` and `completed` challenges.
+- **Open (code-only) matches cannot be hijacked via accept**: `player2_id` is
+  `None`, so everyone gets 403.
+- **Pending list is hard-capped at 10** (`to_list(length=10)`); an invitee
+  with 12 pending challenges silently sees only 10, and there is **no
+  dedupe** — the same challenger can stack unlimited identical challenges
+  (spam vector).
+- **Challenger display name** falls back to the guest display name
+  (`"Guest <id-suffix>"`) because guest identities have no `username`.
+- **`tests/conftest.py` does not stub `delete_one`**, so any test that
+  reaches `cancel_challenge` with the stock mocks would hit a real Motor
+  call; the fake collection in the challenge test file covers it.
