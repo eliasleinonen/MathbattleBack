@@ -183,6 +183,162 @@ dedicated tests also pin what happens when the DB misses.
   reaches `cancel_challenge` with the stock mocks would hit a real Motor
   call; the fake collection in the challenge test file covers it.
 
+## Presence & match lifecycle (`/api/game/status|active|give-up`, `mark_player_seen`, `is_player_connected`)
+
+Findings from `tests/test_match_presence_and_lifecycle_edge_cases.py`
+(68 tests: 67 pass, 1 strict `xfail`). Presence boundaries were tested by
+freezing `main.utc_now`; endpoint-level tests backdate `player_last_seen`
+entries directly on the in-memory match doc.
+
+### Bugs (xfail or explicitly demonstrated)
+
+1. **Abandoned matches remain fully playable ("zombie" matches)** —
+   `test_abandoned_match_should_not_serve_questions` (xfail).
+   Gameplay routes (`/api/game/question`, `/api/game/answer`) only reject
+   status `completed`. A match marked `abandoned` (e.g. by the reconnect
+   window in `start_match`) keeps serving new rounds, accepting answers and
+   incrementing scores, even though `/api/game/active` correctly hides it.
+   Current behavior pinned by
+   `test_current_behavior_abandoned_match_still_serves_questions`.
+
+### Presence semantics (asserted in passing tests)
+
+- **Boundary is inclusive at exactly 12s**: `is_player_connected` uses
+  `<= PRESENCE_TIMEOUT_SECONDS`, so 11.9s ago (and 12.000s exactly) is
+  connected; 12.000001s / 12.1s ago is disconnected.
+- **Bot is always connected** (`"bot-opponent"` short-circuits before any
+  timestamp lookup) — even a poisoned 9999s-stale heartbeat entry for the
+  bot is ignored.
+- **Never-seen players count as connected** (`last_seen is None -> True`).
+  Consequence: on a `waiting` friend match the *nonexistent* opponent is
+  reported `opponent_connected: true` (and `player2_id` is the string
+  `"None"`), and a give-up against an opponent who never polled waits
+  forever instead of auto-resolving.
+- **Every gameplay call is a heartbeat**: `status`, `question`, `answer` and
+  `give-up` all call `mark_player_seen` for the caller only. Keys are
+  stringified, so ObjectId and string forms resolve to the same entry. Naive
+  (Mongo round-trip) timestamps are treated as UTC by `ensure_utc`.
+- **Presence is per-player and one-directional**: a player whose own
+  heartbeat is stale still sees a fresh opponent as connected, while the
+  opponent sees them as gone.
+- **Presence never reaches the DB.** `mark_player_seen` mutates only the
+  in-memory doc; if the match is evicted and reloaded from Mongo
+  (`get_game_status` caches it back), all heartbeat history is lost and a
+  long-gone opponent flips back to "connected".
+- **Outsiders (403) do not pollute the presence map** — the membership check
+  runs before `mark_player_seen` on all routes.
+
+### Give-up / stale-opponent resolution
+
+- With a **connected** (or never-seen) opponent, a solo give-up returns
+  `{"status": "gave_up", "waiting_for_opponent": true}` and the round stays
+  open.
+- With a **stale** opponent (>12s since last poll), the give-up is
+  auto-mirrored: both `*_gave_up` flags are set, the round resolves to
+  `winner_id: "tie"`, and `both_gave_up` is returned — in both friend and
+  ranked matches.
+- **A stale-opponent tie awards no points**, so a walked-away opponent can
+  never be beaten this way: the remaining player can only burn rounds to
+  ties; the match stays `active` indefinitely (no abandonment from presence).
+- After a tie, the next `/api/game/question` creates a fresh round
+  (deterministic id `round-{match_id}-{n}`); a returning opponent shares
+  that round and can win it normally.
+- `give-up` on a round that already has a winner returns `already_ended`;
+  with no round at all it 404s (`"No active round"`). It never checks match
+  status, so it still answers `already_ended` on a **completed** match.
+
+### Lifecycle / status endpoint
+
+- `/api/game/status/{id}` returns identical board state for both players —
+  player1/player2 slots never flip per caller; `opponent_connected` is the
+  only per-caller field. Note the ranked slot assignment: the *joining*
+  poller becomes `player1`, the queued player becomes `player2`.
+- Completed matches: status shows `completed` + `winner_id` to both players;
+  `question`/`answer` are rejected with 400; presence is still tracked and
+  reported on the completed match.
+- `/api/game/active` skips `waiting`, `abandoned` and `completed` matches
+  for both players (only `active` counts), and labels friend matches with
+  `match_type: "friend"`.
+- Reconnect window vs presence: reconnection through `<5s /api/game/start`
+  preserves the `player_last_seen` map, and a stale opponent heartbeat does
+  **not** cause abandonment — the two mechanisms are fully independent.
+  After the window, abandonment flips the status while keeping presence
+  history; the other player only learns via the status poll.
+- `cancel_challenge` works as "delete my waiting friend match": the document
+  is deleted, the code 404s on join/status polls afterwards, non-creators
+  get 403, and an `active` match can no longer be cancelled (400).
+- `/matches/all` reads exclusively from the DB — in-memory matches are
+  invisible to it (returns `[]` with the DB mocked empty), unlike
+  `/match/{id}/details` which falls back to memory.
+
+## ELO & match completion (`calculate_elo_change`, `/api/game/answer` completion path)
+
+Findings from `tests/test_elo_and_match_completion_edge_cases.py`
+(49 tests: 47 pass, 2 strict `xfail`). User-document writes were captured
+with an in-process fake `users_collection` that applies `$inc`/`$set` and
+logs every call.
+
+### Bugs (xfail tests)
+
+1. **User ELO can go negative** — `test_user_elo_should_not_go_negative`
+   (xfail). The loser update is a raw `$inc {"elo": -elo_change}` with no
+   floor, and nothing anywhere clamps ratings, so a user whose live rating
+   is lower than the computed change (e.g. 5 - 20) ends up with negative
+   ELO. Pinned by `test_current_behavior_user_elo_goes_negative`.
+
+2. **`calculate_elo_change` crashes on extreme underdog gaps** —
+   `test_extreme_underdog_gap_should_cap_at_k_not_crash` (xfail, raises
+   `OverflowError`). `10 ** ((loser_elo - winner_elo) / 400)` overflows the
+   float range once the gap exceeds ~123,600 points (exponent > 308).
+   Unreachable through normal play, but there is no input guard, so
+   corrupted/synthetic ratings turn answer submission into a 500. The
+   favorite direction is safe (underflows to 0.0 → change 1). Pinned by
+   `test_current_behavior_extreme_underdog_gap_raises_overflow`.
+
+### `calculate_elo_change` facts (asserted in passing tests)
+
+- Even matchups pay exactly K/2: 20 / 16 / 12 for the three brackets.
+- K-factor boundaries are winner-only and exclusive: 1199→K40, 1200→K32,
+  1799→K32, 1800→K24. Because only the **winner's** rating picks K, a
+  1000-rated winner moves a 1900-rated loser by 40 while the reverse pairing
+  pays 1 — asymmetric transfers by design (or accident).
+- Upsets pay more, favorites less: +400 upset = 36 (K40), −400 favorite = 3
+  (K32); extreme upsets cap at exactly K; extreme favorites floor at
+  `max(1, ...)` — the change is always an int in `[1, K]` (verified over a
+  0–4000 grid).
+- Zero and negative inputs are handled by the formula itself:
+  `(0,0) → 20`, `(0,400) → 36`, `(-400,0) → 36`, `(-1000,-1000) → 20`.
+
+### Completion behavior (asserted in passing tests)
+
+- **First-to-3 ends the match** (`>= 3`, so corrupted scores past 3 also
+  complete); the winning answer response carries
+  `match_winner` + `elo_change`, the match doc flips to `completed` with
+  `winner_id`/`elo_change` set, and both `/api/game/status` and
+  `/match/{id}/details` report the same `elo_change` to both players.
+- **ELO is never applied mid-match**: round wins, wrong answers and tie
+  rounds (even at 2–2 match point) produce `elo_change: 0` and zero
+  `users_collection` writes; only the completing answer triggers exactly two
+  `$inc` calls — winner `{elo: +c, wins: +1}`, loser `{elo: -c, losses: +1}`
+  (zero-sum, mirrored exactly).
+- **No double application**: further answers after completion get
+  `400 "Match is already completed"` and write nothing; status polls never
+  re-touch user docs.
+- **Snapshots, not live ratings**: the change is computed from
+  `player1_elo`/`player2_elo` captured at match creation. A live user doc
+  that diverged to 5000 still pays the 1000-vs-1000 snapshot amount (20),
+  which is then `$inc`-applied on top of the diverged live rating. Mutating
+  the snapshots moves the payout bracket (2000/2000 → 12; 1000-vs-1400
+  upset → 36).
+- **Friend matches are completely unranked**: the `$inc` block only runs for
+  `match_type` in `{"random", "ranked"}`, so friend completion pays
+  `elo_change: 0` and does not even count wins/losses.
+- **Guest ranked matches "pay" phantom ELO**: completion issues both `$inc`
+  updates against user ids that have no documents, so the change shown to
+  the players is persisted nowhere except the match doc. Relatedly, the
+  queued guest's snapshot comes from the hardcoded `{"elo": 1000}` fallback,
+  ignoring the queue entry's recorded ELO.
+
 ## Answer submission, scoring and win conditions (`/api/game/answer`, `/api/game/give-up`, first-to-3)
 
 Findings from `tests/test_match_answer_and_scoring_edge_cases.py` (67 tests:
