@@ -2389,6 +2389,9 @@ async def get_daily_leaderboard(current_user: dict = Depends(get_current_user)):
             if date == today and data.get("correct", False)
         ]
     
+    # Guard against legacy rows that stored a missing time; treat them as slowest
+    # rather than crashing the sort on a None value.
+    completions = [c for c in completions if c.get("time") is not None]
     completions.sort(key=lambda x: x["time"])
     completions = completions[:10]
     
@@ -2460,6 +2463,7 @@ async def get_daily_history(current_user: dict = Depends(get_current_user)):
         
         winner_username = None
         best_time = None
+        date_completions = [c for c in date_completions if c.get("time") is not None]
         if date_completions:
             date_completions.sort(key=lambda x: x["time"])
             winner = date_completions[0]
@@ -2488,8 +2492,22 @@ async def submit_daily_challenge(
     """Submit answer for today's daily challenge"""
     data = await request.json()
     user_answer = data.get("answer")
-    time_taken = data.get("time") or data.get("time_taken")
-    
+
+    # Resolve the time value, accepting either "time" or "time_taken".
+    # Use an explicit None check so a legitimate 0 is not discarded.
+    raw_time = data.get("time")
+    if raw_time is None:
+        raw_time = data.get("time_taken")
+
+    # A valid, non-negative number is required. Storing None here would later
+    # crash the rank comparison and leaderboard sort for every other player.
+    try:
+        time_taken = float(raw_time)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="A numeric time is required")
+    if time_taken < 0:
+        raise HTTPException(status_code=400, detail="Time cannot be negative")
+
     print(f"[DEBUG] Submit: user={current_user['_id']}, time={time_taken}, answer={user_answer}")
     
     # Always use today's date (server-side)
