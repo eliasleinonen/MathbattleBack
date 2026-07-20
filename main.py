@@ -92,6 +92,8 @@ match_locks = {}  # {match_id: asyncio.Lock} - serializes round creation per mat
 # slow networks and short refreshes without false positives.
 PRESENCE_TIMEOUT_SECONDS = 12
 
+QUEUE_STALE_SECONDS = 30  # queued players who stop polling become unmatchable
+
 
 def utc_now() -> datetime:
     """Timezone-aware current UTC time. Use for all round timing math."""
@@ -1190,6 +1192,10 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
             # If match is very recent (less than 5 seconds old), it's a new match from matchmaking
             match_age = (datetime.utcnow() - match.get("created_at", datetime.utcnow())).total_seconds()
             if match_age < 5:
+                # Reconnecting player must leave the queue, otherwise another
+                # searcher could pair with them and create a ghost match.
+                matchmaking_queue.pop(user_id, None)
+                cancelled_users.discard(user_id)
                 opponent_id = match["player1_id"] if str(match["player2_id"]) == user_id else match["player2_id"]
                 opponent = await users_collection.find_one({"_id": opponent_id})
                 return {
@@ -1205,24 +1211,37 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
     
     # Try to find any opponent from the queue (no ELO restriction)
     opponent_id = None
+    opponent_queue_entry = None
+    now = datetime.utcnow()
     for queued_id, queued_data in list(matchmaking_queue.items()):
-        if queued_id != user_id:
-            opponent_id = queued_id
-            break
+        if queued_id == user_id:
+            continue
+        # Drop ghosts: queued players who stopped polling long ago.
+        if (now - queued_data["joined_at"]).total_seconds() > QUEUE_STALE_SECONDS:
+            matchmaking_queue.pop(queued_id, None)
+            continue
+        # Claim the opponent atomically before any await so a concurrent
+        # request can't pair with the same queued player.
+        claimed = matchmaking_queue.pop(queued_id, None)
+        if claimed is None:
+            continue
+        opponent_id = queued_id
+        opponent_queue_entry = claimed
+        break
     
     # If found opponent, create match
     if opponent_id:
-        result = (await users_collection.find_one({"_id": ObjectId(opponent_id)})) if ObjectId.is_valid(opponent_id) else {"_id": opponent_id, "elo": 1000}
-        opponent = result or {"_id": opponent_id, "elo": 1000}
-        # Remove both from queue
         matchmaking_queue.pop(user_id, None)
-        matchmaking_queue.pop(opponent_id, None)
         
         # Check if either user cancelled during matchmaking
         if user_id in cancelled_users or opponent_id in cancelled_users:
             cancelled_users.discard(user_id)
             cancelled_users.discard(opponent_id)
             return {"status": "cancelled"}
+        
+        result = (await users_collection.find_one({"_id": ObjectId(opponent_id)})) if ObjectId.is_valid(opponent_id) else None
+        # Guests aren't in Mongo; trust the ELO snapshot taken when they queued.
+        opponent = result or {"_id": opponent_id, "elo": opponent_queue_entry["elo"]}
         
         # Create match
         match_counter += 1
@@ -1268,6 +1287,8 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
     
     # Check if user is already in queue
     if user_id in matchmaking_queue:
+        # Actively searching again, so any earlier cancel no longer applies.
+        cancelled_users.discard(user_id)
         # Check if 10 seconds have passed
         time_in_queue = (datetime.utcnow() - matchmaking_queue[user_id]["joined_at"]).total_seconds()
         
@@ -1279,7 +1300,9 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
             }
         # Time expired, create bot match
     else:
-        # Add user to matchmaking queue
+        # Add user to matchmaking queue; clear any stale cancel flag so a
+        # previous cancel can't poison this fresh search.
+        cancelled_users.discard(user_id)
         matchmaking_queue[user_id] = {
             "elo": user_elo,
             "joined_at": datetime.utcnow()
@@ -1357,8 +1380,11 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
 async def cancel_matchmaking(current_user = Depends(get_current_user)):
     """Remove user from matchmaking queue and mark as cancelled"""
     user_id = str(current_user["_id"])
-    matchmaking_queue.pop(user_id, None)
-    cancelled_users.add(user_id)  # Mark as cancelled to prevent match creation
+    # Only flag a cancel if the user was actually queued; a stray cancel must
+    # not poison a future search.
+    was_queued = matchmaking_queue.pop(user_id, None) is not None
+    if was_queued:
+        cancelled_users.add(user_id)
     return {"status": "cancelled"}
 
 
