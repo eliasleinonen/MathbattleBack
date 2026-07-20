@@ -1211,7 +1211,17 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
             continue
         if match.get("status") == "active" and (str(match["player1_id"]) == user_id or str(match["player2_id"]) == user_id):
             # If match is very recent (less than 5 seconds old), it's a new match from matchmaking
-            match_age = (datetime.utcnow() - match.get("created_at", datetime.utcnow())).total_seconds()
+            created_raw = match.get("created_at")
+            if created_raw is None:
+                # Missing timestamp: treat as older than the reconnect window so
+                # the match can be abandoned instead of trapping the player.
+                match_age = 5.0
+            else:
+                if isinstance(created_raw, str):
+                    created_at = parse_round_start(created_raw) or utc_now()
+                else:
+                    created_at = ensure_utc(created_raw)
+                match_age = (utc_now() - created_at).total_seconds()
             if match_age < 5:
                 # Reconnecting player must leave the queue, otherwise another
                 # searcher could pair with them and create a ghost match.
