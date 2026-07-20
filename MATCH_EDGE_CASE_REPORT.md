@@ -28,8 +28,8 @@ throughout.
 
 ### Test inventory
 
-23 dedicated edge-case suites, **1084 edge-case tests collected**.
-Full repository suite: **1120 collected → 1061 passed, 59 xfailed**.
+24 dedicated edge-case suites, **1108 edge-case tests collected**.
+Full repository suite: **1144 collected → 1085 passed, 59 xfailed**.
 Every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail markers |
@@ -47,6 +47,7 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_history_and_listing_edge_cases.py` | 33 | 6 |
 | `tests/test_match_isolation_and_access_edge_cases.py` | 38 | 2 |
 | `tests/test_match_math_equivalence_in_pvp_edge_cases.py` | 117 | 3 |
+| `tests/test_match_misc_people_edge_cases.py` | 24 | 0 |
 | `tests/test_match_mongo_hydrate_edge_cases.py` | 26 | 2 |
 | `tests/test_match_multiplayer_stress_edge_cases.py` | 54 | 4 |
 | `tests/test_match_newly_found_bugs_edge_cases.py` | 12 | 6 |
@@ -57,9 +58,9 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_status_gate_edge_cases.py` | 58 | 3 |
 | `tests/test_match_win_completion_edge_cases.py` | 33 | 1 |
 | `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
-| **Edge-case total** | **1084** | **52** |
+| **Edge-case total** | **1108** | **52** |
 
-The full repository suite collects 1120 tests and runs as 1061 passed, 59 xfailed.
+The full repository suite collects 1144 tests and runs as 1085 passed, 59 xfailed.
 
 ### Severity-ranked bug list
 
@@ -2518,3 +2519,97 @@ python3 -m pytest tests/ -q
 Both xfails are `strict` re-pins of already-catalogued bugs
 (`status-no-round-hydration`, `by-code-no-db-fallback`), each with a
 passing current-behavior sibling pin, matching the campaign convention.
+
+## Miscellaneous people-match edges (`tests/test_match_misc_people_edge_cases.py`)
+
+Findings from `tests/test_match_misc_people_edge_cases.py` (24 tests: 24
+pass, 0 xfail). A sweep of the remaining niche edges no dedicated suite
+owned: response link formats, the `MatchStart.continue_existing` default,
+guest username storage, match-code alphabets, RNG determinism, the
+lower-ELO difficulty rule, mid-game cache eviction, and cross-feature
+non-interference (leaderboard, daily challenge, `/api/user/me`).
+
+### Rediscovered known bug (current-behavior pin, no new xfail)
+
+- **Aware `created_at` 500s `/api/game/start`** — bug 12's TypeError
+  rediscovered from the error-handling side
+  (`test_rediscovered_aware_created_at_500s_start_with_generic_detail`):
+  an active match carrying a tz-aware `created_at` makes the reconnect
+  window's naive `datetime.utcnow()` subtraction raise `TypeError`,
+  which the global handler converts to the generic
+  `"Something went wrong. Please try again."` 500. The pin adds the
+  handler-side blast radius: **no internals leak** (`TypeError` /
+  traceback text absent from the body), the failure is **persistent
+  across retries**, and the poisoned match itself is left untouched
+  (never abandoned, never matched). The should-reconnect xfail lives in
+  the datetime suite; this suite adds only passing pins.
+
+### Quirks pinned (passing tests)
+
+- **Friend share links are hardcoded to localhost** — the create
+  response's `link` is exactly
+  `http://localhost:3000/play/friend/{match_code}` (identical for open
+  invites and named challenges); no env-driven origin exists, so a
+  production share link points at a dev frontend.
+- **`continue_existing=True` never returns the old match** — it only
+  *suppresses the abandonment*: the stale active match stays `active`
+  in memory, but the caller is still queued and told `"searching"`.
+  Omitted, explicit `false` and JSON `null` all behave identically
+  (stale match → `abandoned`, caller queued); on the model, the default
+  is `False` while an explicit `null` is preserved as `None` (falsy).
+- **Named challenge to an unknown username degrades silently** — no
+  user matches, so `player2_id` stays `None` and status is `"waiting"`
+  (an open code invite, not `"pending"`), yet the unmatched username is
+  still written onto the doc as `player2_username`.
+- **Guest usernames in match docs**: `player1_username` falls back
+  through `.get("username", name)` to the synthetic `"Guest xxxx"`
+  display name (never a literal `None`); an open invite stores
+  `player2_username: None` and `join` **never backfills it**. The
+  status poll ignores both stored names anyway — guests aren't in
+  `users_collection`, so it serves `"Player 1"` / `"Player 2"`.
+- **Two code alphabets**: friend codes are exactly 6 chars of
+  `A-Z0-9` (already uppercase as stored); ranked *and* bot-fallback
+  codes are `secrets.token_urlsafe(8)` → 11 URL-safe base64 chars
+  (`A-Za-z0-9_-`). Since the friend-join route upper-cases its input,
+  a mixed-case ranked code could never be joined by code.
+- **Bot identity is `random`-seeded, not `secrets`** — seeding the
+  module-level RNG reproduces the exact same bot name *and* ELO offset
+  across a full state wipe; the roster and the −150…−50 offset range
+  hold as documented in the bot-fallback suite.
+- **Difficulty always follows the lower ELO** — `generate_question`
+  receives `min(player1_elo, player2_elo)` whichever slot holds the
+  weaker player (2000/800 and 800/2000 both yield 800; 1500/1500 yields
+  1500), asserted via a generator spy.
+- **Mid-game eviction is survivable end-to-end** (FakeDB-backed): with
+  the match doc deleted from memory mid-round, the next `question`
+  hydrates the persisted doc — whose written-back `current_round_id`
+  resolves to the still-cached round — and the opponent resumes the
+  *same* round (id, expression, byte-identical `round_start_time`),
+  then scores normally with write-backs landing in the DB doc. Evicted
+  *after* a scored round, the status poll hydrates with the score
+  intact and the next question rolls forward to round 2 (the persisted
+  `rounds` array grows to 2) instead of replaying round 1.
+- **Cross-feature non-interference**: `/api/leaderboard` returns 200
+  (empty, guests never persist) before and after a completed ranked
+  match; a full daily-challenge fetch+submit mid-match leaves
+  `in_memory_matches`, `in_memory_rounds` and the queue deep-equal to
+  their snapshots and the match fully playable; `/api/user/me` during
+  an active match serves the stable guest identity (exactly
+  `{id, email, name, username, elo}`, `username: None`, `elo: 1000`) —
+  and still reports 1000 for both players *after* a ranked win pays out
+  a positive `elo_change`, because guest identities are rebuilt from
+  the token on every request.
+
+### How to run
+
+```bash
+# Miscellaneous edges suite only (24 tests, all passing)
+python3 -m pytest tests/test_match_misc_people_edge_cases.py -q
+
+# Full repository suite (1144 tests: 1085 pass, 59 xfail)
+python3 -m pytest tests/ -q
+```
+
+No new xfails: the one bug touched here (aware `created_at` → 500) was
+already catalogued as bug 12 and is pinned from a new angle by passing
+current-behavior tests.
