@@ -28,8 +28,8 @@ throughout.
 
 ### Test inventory
 
-24 dedicated edge-case suites, **1108 edge-case tests collected**.
-Full repository suite: **1144 collected → 1085 passed, 59 xfailed**.
+25 dedicated edge-case suites, **1124 edge-case tests collected**.
+Full repository suite: **1160 collected → 1097 passed, 63 xfailed**.
 Every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail markers |
@@ -40,6 +40,7 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_friend_match_edge_cases.py` | 44 | 2 |
 | `tests/test_match_answer_and_scoring_edge_cases.py` | 67 | 1 |
 | `tests/test_match_api_contract_edge_cases.py` | 80 | 1 |
+| `tests/test_match_audit_pass_2_edge_cases.py` | 16 | 4 |
 | `tests/test_match_auth_identity_edge_cases.py` | 37 | 0 |
 | `tests/test_match_cancel_and_queue_lifecycle_edge_cases.py` | 25 | 4 |
 | `tests/test_match_datetime_and_memory_edge_cases.py` | 46 | 3 |
@@ -58,9 +59,9 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_status_gate_edge_cases.py` | 58 | 3 |
 | `tests/test_match_win_completion_edge_cases.py` | 33 | 1 |
 | `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
-| **Edge-case total** | **1108** | **52** |
+| **Edge-case total** | **1124** | **56** |
 
-The full repository suite collects 1144 tests and runs as 1085 passed, 59 xfailed.
+The full repository suite collects 1160 tests and runs as 1097 passed, 63 xfailed.
 
 ### Severity-ranked bug list
 
@@ -295,10 +296,10 @@ passing tests that assert the broken behavior.
 ### How to run the tests
 
 ```bash
-# Full suite (1120 tests: 1061 pass, 59 xfail)
+# Full suite (1160 tests: 1097 pass, 63 xfail)
 python3 -m pytest tests/ -q
 
-# Edge-case campaign only (1084 tests: 1025 pass, 59 xfail)
+# Edge-case campaign only (1124 tests: 1061 pass, 63 xfail)
 python3 -m pytest tests/test_*edge_cases*.py -q
 
 # Verify the inventory
@@ -2613,3 +2614,106 @@ python3 -m pytest tests/ -q
 No new xfails: the one bug touched here (aware `created_at` → 500) was
 already catalogued as bug 12 and is pinned from a new angle by passing
 current-behavior tests.
+
+## Audit pass 2 (`tests/test_match_audit_pass_2_edge_cases.py`)
+
+A second full audit read of the match code in `main.py` (start_match,
+submit_answer including the inline SymPy grading cascade, get_question,
+give_up_round, presence, queue lifecycle), diffed line-by-line against the
+existing suites and the numbered bug list above. Four genuinely new,
+previously untested bugs were found; each was verified end-to-end through
+the real endpoints before being pinned. 16 tests (12 pass, 4 strict
+`xfail`). With this file the full repository suite collects **1160 tests**
+and runs as **1097 passed, 63 xfailed**.
+
+### New bugs (severity-ranked)
+
+38. **P2 — `submit_answer` never enforces the 5-minute PvP round expiry**
+    (strict xfail `BUG(answer-ignores-round-expiry)`,
+    `test_answer_on_expired_round_should_not_score`, plus three passing
+    pins). `get_question` voids any round older than 300s as a tie, and
+    the bot branch of `submit_answer` forfeits at `time_limit` — but the
+    people-vs-people answer path has **no expiry check at all**. A correct
+    answer submitted hours late still wins the round
+    (`test_current_behavior_hours_old_round_answer_still_wins`), and at
+    match point it completes a ranked match and pays real ELO on a round
+    the very next `get_question` would have voided
+    (`test_current_behavior_expired_round_completes_ranked_match_and_pays_elo`).
+    Which of "point" vs "void" a stale round becomes depends solely on
+    which endpoint touches it first
+    (`test_current_behavior_question_would_have_tied_the_same_round`).
+    Exploit: sit on a question indefinitely (only poll `status`, never
+    re-request `question`) and submit whenever the answer is worked out.
+    *Fix:* run the same 300s `parse_round_start` check at the top of
+    `submit_answer` and tie the round instead of grading.
+
+39. **P2 — The numeric grading fallback accepts mathematically wrong
+    answers within 1e-6** (strict xfail `BUG(numeric-fallback-epsilon)`,
+    `test_answer_off_by_a_tiny_constant_should_be_rejected`, plus pins).
+    When every symbolic check fails, `submit_answer` samples 5 points from
+    `uniform(1, 10)` and flips `correct = True` if the values agree within
+    an **absolute 1e-6**. `2*x + 1e-7`, `2*x + 0.0000001` and
+    `2*x*(1+1e-9)` are all deterministically accepted for `2·x` — even
+    though `simplify` and `.equals` both correctly refuted them moments
+    earlier (the fallback overrides the symbolic verdict). The cliff is
+    pinned from both sides: `2*x + 2e-6` is still rejected
+    (`test_current_behavior_just_above_tolerance_is_still_rejected`).
+
+40. **P3 — The numeric fallback samples only x ∈ (1, 10), so
+    positive-axis lookalikes grade as correct** (strict xfail
+    `BUG(numeric-fallback-positive-domain)`,
+    `test_abs_answer_should_be_rejected_for_polynomial_derivative`, plus
+    pins). Both spellings of 2|x| — `2*abs(x)` and `2*sqrt(x^2)` — are
+    accepted for `2·x` although they are wrong for every x < 0, because
+    every sample point the fallback can draw is positive
+    (`test_current_behavior_positive_axis_lookalikes_are_accepted`). The
+    contrast pin shows `-2*x` (wrong *on* the sampled interval) is caught
+    by the same fallback, isolating the hole to the sign of the domain.
+    *Fix for 39+40:* don't let the numeric fallback override a symbolic
+    refutation; if kept, use a relative tolerance and sample both signs.
+
+41. **P2 — The `/api/game/start` reconnect branch never dequeues the
+    caller, deterministically pairing the next searcher into a ghost
+    match** (strict xfail `BUG(reconnect-leaves-queue-entry)`,
+    `test_reconnect_should_remove_the_callers_queue_entry`, plus two
+    passing pins). Only the pairing branch pops `matchmaking_queue`; the
+    <5s reconnect return does not. Realistic sequence: A queues for
+    ranked ("searching"), a friend joins A's open friend match (now
+    active and fresh), A's next ranked poll hits the reconnect branch and
+    is handed the friend match (the bug-7 hijack window) — while A's
+    queue entry stays live. The next ranked searcher C is then paired
+    against A into a "ranked" match A never learns about: A's
+    `/api/game/active` surfaces only the earlier friend match
+    (insertion-order scan), so C waits against an absent opponent
+    (`test_current_behavior_leftover_queue_entry_pairs_a_ghost_match`)
+    and can solo-play the ghost to a completed 3-0
+    (`test_current_behavior_ghost_match_is_playable_solo_by_the_newcomer`).
+    Unlike the known hour-stale-queue-entry finding (stress suite), this
+    needs no staleness at all — the entry is seconds old and the pairing
+    is deterministic. *Fix:* `matchmaking_queue.pop(user_id, None)` in
+    the reconnect return path (and arguably whenever the scan finds any
+    active match for the caller).
+
+### What was checked and found already covered
+
+The pass also traced: `continue_existing` semantics (pinned, misc +
+reconnect suites), unknown-username challenge degradation (pinned),
+give-up vs answer races (pinned), hydrated give-up flag erasure (bug 28),
+queue-ELO snapshot quirks (pinned in the ELO suite), reconnect opponent
+labeling (pinned), `match_locks` leaks (cancel suite), bot `time_limit`
+boundary semantics (bot suite), and the finite-difference grading cheat
+(rejected by float cancellation — not a bug). Those produced no new
+entries.
+
+### How to run
+
+```bash
+# Audit pass 2 suite only (16 tests: 12 pass, 4 xfail)
+python3 -m pytest tests/test_match_audit_pass_2_edge_cases.py -q
+
+# Full repository suite (1160 tests: 1097 pass, 63 xfail)
+python3 -m pytest tests/ -q
+```
+
+All four xfails are `strict` and sit next to passing current-behavior
+pins, matching the campaign convention.
