@@ -86,6 +86,16 @@ match_counter = 0
 round_counter = 0
 match_locks = {}  # {match_id: asyncio.Lock} - serializes round creation per match
 
+def new_match_id() -> str:
+    """Collision-resistant match id (safe across process restarts)."""
+    return f"match-{secrets.token_hex(8)}"
+
+
+def new_round_id() -> str:
+    """Collision-resistant round id (round_number lives on the document)."""
+    return f"round-{secrets.token_hex(12)}"
+
+
 # How long (seconds) a player can go without polling before we treat them as
 # having left the match. The frontend polls status every 0.5s, so 12s covers
 # slow networks and short refreshes without false positives.
@@ -885,7 +895,7 @@ async def create_friend_match(data: FriendMatchCreate, current_user = Depends(ge
             opponent_elo = opponent.get("elo", 1000)
     
     # Create match with timestamp-based unique ID
-    match_id = f"match-{int(datetime.utcnow().timestamp() * 1000)}-{random.randint(1000, 9999)}"
+    match_id = new_match_id()
     
     match_doc = {
         "_id": match_id,
@@ -1085,8 +1095,6 @@ async def cancel_challenge(match_id: str, current_user = Depends(get_current_use
 
 @app.post("/api/game/start")
 async def start_match(match_data: MatchStart, current_user = Depends(get_current_user)):
-    global match_counter
-    
     user_id = str(current_user["_id"])  # Convert to string for consistent comparison
     user_elo = current_user["elo"]
     
@@ -1131,8 +1139,7 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
             return {"status": "cancelled"}
         
         # Create match
-        match_counter += 1
-        match_id = f"match-{match_counter}"
+        match_id = new_match_id()
         match_code = secrets.token_urlsafe(8)  # Generate unique code
         
         match_doc = {
@@ -1217,8 +1224,7 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
     }
     
     # Create match
-    match_counter += 1
-    match_id = f"match-{match_counter}"
+    match_id = new_match_id()
     match_code = secrets.token_urlsafe(8)  # Generate unique code
     
     match_doc = {
@@ -1434,7 +1440,7 @@ async def _create_next_round(match_id: str, match: dict) -> dict:
 
     # Deterministic per-match round id so a retried/duplicated creation cannot
     # fork the match into two different "current" rounds.
-    round_id = f"round-{match_id}-{round_count + 1}"
+    round_id = new_round_id()
     round_doc = {
         "_id": round_id,
         "match_id": match_id,
