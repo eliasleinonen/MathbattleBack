@@ -28,31 +28,36 @@ throughout.
 
 ### Test inventory
 
-Fifteen dedicated edge-case suites, **796 tests collected** (verified with
-`pytest --collect-only -q`), currently running as **767 passed,
-29 xfailed** — every xfail is strict and pins a real bug documented below.
+19 dedicated edge-case suites, **932 edge-case tests collected**
+(verified with `pytest --collect-only -q`). Full repository suite:
+**968 collected → 924 passed, 44 xfailed**.
+Every xfail is strict and pins a real bug documented below.
 
-| File | Tests | xfail |
+| File | Tests | xfail markers |
 |---|---|---|
-| `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
-| `tests/test_friend_match_edge_cases.py` | 44 | 2 |
-| `tests/test_challenge_match_edge_cases.py` | 31 | 1 |
-| `tests/test_match_presence_and_lifecycle_edge_cases.py` | 68 | 1 |
-| `tests/test_elo_and_match_completion_edge_cases.py` | 49 | 2 |
-| `tests/test_match_answer_and_scoring_edge_cases.py` | 67 | 1 |
-| `tests/test_match_question_and_round_edge_cases.py` | 68 | 2 |
-| `tests/test_match_datetime_and_memory_edge_cases.py` | 46 | 3 |
-| `tests/test_match_isolation_and_access_edge_cases.py` | 38 | 2 |
 | `tests/test_bot_fallback_and_timeout_edge_cases.py` | 28 | 1 |
-| `tests/test_match_cancel_and_queue_lifecycle_edge_cases.py` | 25 | 4 |
+| `tests/test_challenge_match_edge_cases.py` | 31 | 1 |
+| `tests/test_elo_and_match_completion_edge_cases.py` | 49 | 2 |
+| `tests/test_friend_match_edge_cases.py` | 44 | 2 |
+| `tests/test_match_answer_and_scoring_edge_cases.py` | 67 | 1 |
 | `tests/test_match_api_contract_edge_cases.py` | 80 | 1 |
+| `tests/test_match_auth_identity_edge_cases.py` | 37 | 0 |
+| `tests/test_match_cancel_and_queue_lifecycle_edge_cases.py` | 25 | 4 |
+| `tests/test_match_datetime_and_memory_edge_cases.py` | 46 | 3 |
+| `tests/test_match_giveup_status_edge_cases.py` | 56 | 2 |
+| `tests/test_match_history_and_listing_edge_cases.py` | 33 | 6 |
+| `tests/test_match_isolation_and_access_edge_cases.py` | 38 | 2 |
 | `tests/test_match_math_equivalence_in_pvp_edge_cases.py` | 117 | 3 |
 | `tests/test_match_multiplayer_stress_edge_cases.py` | 54 | 4 |
-| `tests/test_match_auth_identity_edge_cases.py` | 37 | 0 |
-| **Total** | **796** | **29** |
+| `tests/test_match_newly_found_bugs_edge_cases.py` | 12 | 6 |
+| `tests/test_match_presence_and_lifecycle_edge_cases.py` | 68 | 1 |
+| `tests/test_match_question_and_round_edge_cases.py` | 68 | 2 |
+| `tests/test_match_reconnect_abandon_edge_cases.py` | 35 | 1 |
+| `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
+| **Edge-case total** | **932** | **44** |
 
 The full repository suite (including pre-existing tests) collects
-832 tests and runs as 803 passed, 29 xfailed.
+968 tests and runs as 924 passed, 44 xfailed.
 
 ### Severity-ranked bug list
 
