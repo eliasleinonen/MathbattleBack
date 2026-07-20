@@ -1,4 +1,172 @@
-# Match Edge Case Report
+# Match Edge Case Campaign Report
+
+## Executive summary
+
+### What was tested
+
+Every people-vs-people match flow in the backend: ranked matchmaking
+(queue, cancel, reconnect, bot fallback), friend matches (create/join by
+code, challenges to a named user), the challenge accept/cancel endpoints,
+presence tracking and give-up resolution, question serving and round
+progression, answer grading and first-to-3 win conditions, ELO calculation
+and payout, datetime/timezone handling, in-memory-vs-Mongo state
+divergence, and cross-match isolation / access control. Concurrency races,
+DB-unavailable fallbacks, cache eviction/restart scenarios, and malformed
+input were exercised throughout.
+
+### Test inventory
+
+Nine dedicated edge-case suites, **455 tests collected** (verified with
+`pytest --collect-only -q`), currently running as **439 passed,
+16 xfailed** — every xfail is strict and pins a real bug documented below.
+
+| File | Tests | xfail |
+|---|---|---|
+| `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
+| `tests/test_friend_match_edge_cases.py` | 44 | 2 |
+| `tests/test_challenge_match_edge_cases.py` | 31 | 1 |
+| `tests/test_match_presence_and_lifecycle_edge_cases.py` | 68 | 1 |
+| `tests/test_elo_and_match_completion_edge_cases.py` | 49 | 2 |
+| `tests/test_match_answer_and_scoring_edge_cases.py` | 67 | 1 |
+| `tests/test_match_question_and_round_edge_cases.py` | 68 | 2 |
+| `tests/test_match_datetime_and_memory_edge_cases.py` | 46 | 3 |
+| `tests/test_match_isolation_and_access_edge_cases.py` | 38 | 2 |
+| **Total** | **455** | **16** |
+
+The full repository suite (including pre-existing tests) collects
+491 tests.
+
+### Severity-ranked bug list
+
+Consolidated from the detailed sections below. "xfail" bugs are pinned by
+a strict expected-failure test; the rest are explicitly demonstrated by
+passing tests that assert the broken behavior.
+
+**P0 — security or data integrity, exploitable/likely in production**
+
+1. **`/match/{match_id}/details` is a live answer oracle with no
+   authentication or authorization** (xfail, isolation suite). Anyone with
+   a match id — including the opponent in a second tab — can read the
+   correct answer of the still-unresolved round mid-game. The response
+   also leaks the match code, unlocking anonymous status polling.
+2. **Double-score race when a round is re-read from the DB** (xfail,
+   answer/scoring suite). `submit_answer` takes no match lock; on a
+   round-cache miss two concurrent correct answers both win the round and
+   one round pays a point to each player. Any multi-worker deployment or
+   cache eviction hits this path.
+3. **`match_counter` restart collision overwrites live matches** (xfail,
+   datetime/memory suite). Ranked ids are `match-{counter}`; after a
+   process restart the counter resets, `match-1` is re-issued, and the
+   still-live original match is replaced — its players get 403 on their
+   own match.
+
+**P1 — gameplay correctness bugs users will hit**
+
+4. **Concurrent friend-match join race** (friend suite). No per-match
+   lock in `join_friend_match`: with any DB latency two players both get
+   a 200 and the second silently overwrites the first joiner.
+5. **Double-pairing race for registered ranked opponents** (xfail, ranked
+   suite). An `await` between selecting and popping a queued ObjectId
+   player lets two concurrent callers each match the same person.
+6. **Stale cancel flag poisons the next pairing** (xfail, ranked suite).
+   Re-queueing after `/api/game/cancel` never clears `cancelled_users`;
+   the next opponent to pair with that user gets a spurious
+   `"cancelled"` and the user is silently dropped from the queue.
+7. **Queueing for ranked abandons or hijacks an active friend match**
+   (xfail, isolation suite). The stale-match scan ignores `match_type`,
+   so "play ranked" reconnects into (or abandons) a live friend match.
+8. **Abandoned "zombie" matches remain fully playable** (xfail, presence
+   suite). Gameplay routes only reject `completed`, so abandoned matches
+   keep serving rounds and accepting scores.
+9. **Pending challenges are playable without being accepted** (challenge
+   suite). Both parties can fetch questions and score on a challenge
+   nobody accepted, bypassing the accept step.
+10. **Tie rounds desync the Mongo rounds-array numbering** (xfail,
+    question/round suite). Round docs count rounds; array summaries count
+    scores. Any tie makes the numbering diverge permanently, and
+    subsequent positional updates hit the wrong (or no) array entry.
+11. **Round ids are reused after round-cache loss / memory wipe** (two
+    xfails, question/round and datetime/memory suites — one root cause).
+    Round numbering derives from `in_memory_rounds` only, so a restart or
+    eviction re-issues `round-<match>-1`, silently diverging memory and
+    Mongo under one round id.
+12. **Aware (or ISO-string) `created_at` turns `/api/game/start` into a
+    500** (xfail, datetime/memory suite). The reconnect window subtracts
+    naive `datetime.utcnow()` with no `ensure_utc`, so any tz-aware
+    migration breaks the start endpoint for that player.
+13. **Friend match-code uniqueness ignores in-memory matches** (xfail,
+    friend suite). With the DB empty or down, two live matches can share
+    a code and the second becomes unreachable.
+
+**P2 — robustness, consistency and policy gaps**
+
+14. **User ELO can go negative** (xfail, ELO suite) — the loser `$inc`
+    has no floor.
+15. **`calculate_elo_change` crashes (`OverflowError`) on extreme rating
+    gaps** (xfail, ELO suite) — no input guard; corrupted ratings turn
+    answer submission into a 500.
+16. **Match-code case-sensitivity is inconsistent** (xfail, friend
+    suite). `/api/game/match/{code}` compares case-sensitively while the
+    friend endpoints upper-case; the two code namespaces disagree.
+17. **Self-challenge is allowed** (xfail, challenge suite) — a user can
+    create and accept a challenge against themselves.
+18. **Challenge endpoints have no in-memory fallback** (challenge suite).
+    With the DB down, a memory-held pending challenge is invisible to
+    `pending`/`accept`/`cancel` yet still playable (see bug 9).
+19. **Broad unauthenticated exposure**: `/matches/all` returns the last
+    50 matches of all players to any caller, and
+    `/api/game/friend/status/{code}` polls any match anonymously.
+
+### Recommended fix order
+
+1. **Lock down `/match/{id}/details`** (bug 1): require auth + participant
+   check, and strip unresolved-round answers from the payload. Smallest
+   change, biggest exploit closed.
+2. **Serialize writes with the existing per-match lock** (bugs 2, 4, 5):
+   `submit_answer` and `join_friend_match` should take `get_match_lock`
+   like `get_question` already does; move the ranked opponent pop before
+   the `find_one` await (or re-check after it).
+3. **Fix id generation** (bugs 3, 11): replace `match_counter` with a
+   collision-free id (UUID/ObjectId) and derive round numbers from the
+   match doc or Mongo, not from `in_memory_rounds`.
+4. **Fix lifecycle/status gating** (bugs 6, 7, 8, 9): clear
+   `cancelled_users` on re-queue, filter the stale-match scan by
+   `match_type`, and have gameplay routes reject `abandoned` and
+   `pending` matches, not just `completed`.
+5. **Fix round-array numbering** (bug 10): number the `$push`ed summary
+   with the same `round_count + 1` used for the round doc.
+6. **Harden datetime handling** (bug 12): run `created_at` through
+   `ensure_utc`/`parse_round_start` in the reconnect window.
+7. **Sweep the P2s** (bugs 13–19): in-memory code-collision check, ELO
+   floor and overflow guard, code-case normalization, self-challenge
+   rejection, challenge memory fallback, and an access review of
+   `/matches/all` and the anonymous status poller.
+
+### How to run the tests
+
+```bash
+# Full suite (491 tests)
+python3 -m pytest tests/ -q
+
+# Edge-case campaign only (455 tests: 439 pass, 16 xfail)
+python3 -m pytest tests/test_ranked_matchmaking_edge_cases.py \
+  tests/test_friend_match_edge_cases.py \
+  tests/test_challenge_match_edge_cases.py \
+  tests/test_match_presence_and_lifecycle_edge_cases.py \
+  tests/test_elo_and_match_completion_edge_cases.py \
+  tests/test_match_answer_and_scoring_edge_cases.py \
+  tests/test_match_question_and_round_edge_cases.py \
+  tests/test_match_datetime_and_memory_edge_cases.py \
+  tests/test_match_isolation_and_access_edge_cases.py -q
+
+# Verify the inventory
+python3 -m pytest --collect-only -q tests/
+```
+
+All xfails are `strict`, so a fixed bug will surface as `XPASS` and fail
+the run — flip the corresponding test to a plain assertion when fixing.
+
+The detailed per-area findings follow.
 
 ## Ranked matchmaking (`/api/game/start`, `/api/game/cancel`, `/api/game/active`)
 
