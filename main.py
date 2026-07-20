@@ -937,36 +937,42 @@ async def join_friend_match(data: FriendMatchJoin, current_user = Depends(get_cu
         raise HTTPException(status_code=404, detail="Match not found")
     
     match_id = match["_id"]
-    
-    if match["status"] != "waiting":
-        raise HTTPException(status_code=400, detail="Match already started")
-    
-    if match["player1_id"] == current_user["_id"]:
-        raise HTTPException(status_code=400, detail="Cannot join your own match")
-    
-    # Join as player 2
-    match["player2_id"] = current_user["_id"]
-    match["player2_elo"] = current_user["elo"]
-    match["status"] = "active"
-    
-    # Update in memory
-    if match_id in in_memory_matches:
+
+    # Serialize joins so two concurrent callers cannot both become player2.
+    async with get_match_lock(match_id):
+        locked = in_memory_matches.get(match_id)
+        if locked is None:
+            locked = await matches_collection.find_one({"_id": match_id})
+            if locked is None:
+                locked = match
+            in_memory_matches[match_id] = locked
+        match = locked
+
+        if match["status"] != "waiting":
+            raise HTTPException(status_code=400, detail="Match already started")
+
+        if match["player1_id"] == current_user["_id"]:
+            raise HTTPException(status_code=400, detail="Cannot join your own match")
+
+        # Join as player 2
+        match["player2_id"] = current_user["_id"]
+        match["player2_elo"] = current_user["elo"]
+        match["status"] = "active"
         in_memory_matches[match_id] = match
-    
-    # Update in database
-    await matches_collection.update_one(
-        {"_id": match_id},
-        {"$set": {
-            "player2_id": current_user["_id"],
-            "player2_elo": current_user["elo"],
+
+        await matches_collection.update_one(
+            {"_id": match_id},
+            {"$set": {
+                "player2_id": current_user["_id"],
+                "player2_elo": current_user["elo"],
+                "status": "active"
+            }}
+        )
+
+        return {
+            "match_id": match_id,
             "status": "active"
-        }}
-    )
-    
-    return {
-        "match_id": match_id,
-        "status": "active"
-    }
+        }
 
 
 @app.get("/api/game/friend/status/{match_code}")
@@ -1508,6 +1514,11 @@ async def _create_next_round(match_id: str, match: dict) -> dict:
 @app.post("/api/game/give-up")
 async def give_up_round(match_id: str, current_user = Depends(get_current_user)):
     """Mark that player wants to give up current round"""
+    async with get_match_lock(match_id):
+        return await _give_up_round_locked(match_id, current_user)
+
+
+async def _give_up_round_locked(match_id: str, current_user):
     match = in_memory_matches.get(match_id)
 
     
@@ -1529,11 +1540,14 @@ async def give_up_round(match_id: str, current_user = Depends(get_current_user))
     
     round_doc = in_memory_rounds.get(round_id)
     if not round_doc:
-        round_doc = await rounds_collection.find_one({"_id": round_id})
-        if round_doc:
-            in_memory_rounds[round_id] = round_doc
-        else:
-            raise HTTPException(status_code=404, detail="Round not found")
+        loaded = await rounds_collection.find_one({"_id": round_id})
+        # Prefer any in-memory copy written while we awaited the DB.
+        round_doc = in_memory_rounds.get(round_id)
+        if round_doc is None:
+            if not loaded:
+                raise HTTPException(status_code=404, detail="Round not found")
+            in_memory_rounds[round_id] = loaded
+            round_doc = loaded
     
     # Check if round already has a winner
     if round_doc.get("winner_id"):
@@ -1543,11 +1557,9 @@ async def give_up_round(match_id: str, current_user = Depends(get_current_user))
     is_player1 = str(current_user["_id"]) == str(match["player1_id"])
     give_up_field = "player1_gave_up" if is_player1 else "player2_gave_up"
     
-    # Mark player as gave up
-    if give_up_field not in round_doc:
-        round_doc["player1_gave_up"] = False
-        round_doc["player2_gave_up"] = False
-    
+    # Mark player as gave up without wiping the opponent's persisted flag.
+    round_doc.setdefault("player1_gave_up", False)
+    round_doc.setdefault("player2_gave_up", False)
     round_doc[give_up_field] = True
     in_memory_rounds[round_id] = round_doc
     
@@ -1608,6 +1620,12 @@ async def give_up_round(match_id: str, current_user = Depends(get_current_user))
 
 @app.post("/api/game/answer")
 async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_user)):
+    """Submit an answer for the current round (serialized per match)."""
+    async with get_match_lock(data.match_id):
+        return await _submit_answer_locked(data, current_user)
+
+
+async def _submit_answer_locked(data: AnswerSubmit, current_user):
     match = in_memory_matches.get(data.match_id)
 
     
@@ -1638,11 +1656,14 @@ async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_u
     # Try to get round from memory, otherwise load from database
     round_doc = in_memory_rounds.get(round_id)
     if not round_doc:
-        round_doc = await rounds_collection.find_one({"_id": round_id})
-        if round_doc:
-            in_memory_rounds[round_id] = round_doc
-        else:
-            raise HTTPException(status_code=404, detail="Round not found")
+        loaded = await rounds_collection.find_one({"_id": round_id})
+        # Prefer any in-memory copy written while we awaited the DB.
+        round_doc = in_memory_rounds.get(round_id)
+        if round_doc is None:
+            if not loaded:
+                raise HTTPException(status_code=404, detail="Round not found")
+            in_memory_rounds[round_id] = loaded
+            round_doc = loaded
     
     # Check if round already has a winner (someone already answered correctly)
     if round_doc.get("winner_id"):
