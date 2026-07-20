@@ -16,14 +16,21 @@ queue lifecycle, the HTTP API contract (response-key shapes, status-code
 matrix, content-type/method negotiation, injection/long-input hardening),
 and PvP math-equivalence grading (equivalent/inequivalent answer forms,
 unicode operators, numeric tolerance, and SymPy crash/DoS inputs).
-Concurrency races, DB-unavailable fallbacks, cache eviction/restart
-scenarios, and malformed input were exercised throughout.
+A dedicated multiplayer stress / sequential-chaos suite simulates many
+people matching at once: 10-guest queue waves, parallel start spam from one
+user, cancel/start churn, friend-match create spam with random joins, full
+first-to-3 matches played end-to-end, parallel ranked matches, immediate
+rematch cycles, challenge spam against the pending-list cap, give-up
+storms, status-polling storms, friend+ranked overlap for one pair, and
+hour-stale queue entries. Concurrency races, DB-unavailable fallbacks,
+cache eviction/restart scenarios, and malformed input were exercised
+throughout.
 
 ### Test inventory
 
-Fifteen dedicated edge-case suites, **795 tests collected** (verified with
+Fifteen dedicated edge-case suites, **796 tests collected** (verified with
 `pytest --collect-only -q`), currently running as **767 passed,
-28 xfailed** — every xfail is strict and pins a real bug documented below.
+29 xfailed** — every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail |
 |---|---|---|
@@ -39,13 +46,13 @@ Fifteen dedicated edge-case suites, **795 tests collected** (verified with
 | `tests/test_bot_fallback_and_timeout_edge_cases.py` | 28 | 1 |
 | `tests/test_match_cancel_and_queue_lifecycle_edge_cases.py` | 25 | 4 |
 | `tests/test_match_api_contract_edge_cases.py` | 80 | 1 |
-| `tests/test_match_math_equivalence_in_pvp_edge_cases.py` | 116 | 2 |
+| `tests/test_match_math_equivalence_in_pvp_edge_cases.py` | 117 | 3 |
 | `tests/test_match_multiplayer_stress_edge_cases.py` | 54 | 4 |
 | `tests/test_match_auth_identity_edge_cases.py` | 37 | 0 |
-| **Total** | **795** | **28** |
+| **Total** | **796** | **29** |
 
 The full repository suite (including pre-existing tests) collects
-831 tests and runs as 803 passed, 28 xfailed.
+832 tests and runs as 803 passed, 29 xfailed.
 
 ### Severity-ranked bug list
 
@@ -88,10 +95,18 @@ passing tests that assert the broken behavior.
    (bot suite), it is planted by a **stray cancel from a user who was
    never queued** and aborts their first-ever pairing (cancel suite), and
    it **survives an entire completed match** to abort the user's next
-   pairing in a fresh session (cancel suite).
+   pairing in a fresh session (cancel suite). The multiplayer stress suite
+   adds a population-level xfail: after rapid cancel/start churn by 5
+   users, a full mass re-queue forms **zero** matches — every pairing
+   attempt is eaten pairwise by leftover flags, and it takes two more mass
+   passes before anyone actually matches.
 7. **Queueing for ranked abandons or hijacks an active friend match**
-   (xfail, isolation suite). The stale-match scan ignores `match_type`,
-   so "play ranked" reconnects into (or abandons) a live friend match.
+   (xfails, isolation and multiplayer stress suites). The stale-match scan
+   ignores `match_type`, so "play ranked" reconnects into (or abandons) a
+   live friend match. The stress suite pins the pair-level fallout: when
+   **both** players of a fresh friend match tap "play ranked", both are
+   hijacked back into the friend match, neither enters the queue, and no
+   ranked match can ever form for that pair.
 8. **Abandoned "zombie" matches remain fully playable** (xfail, presence
    suite). Gameplay routes only reject `completed`, so abandoned matches
    keep serving rounds and accepting scores.
@@ -119,15 +134,19 @@ passing tests that assert the broken behavior.
     read latency the join returns 200 and the cancel then deletes the
     now-active match from DB and memory, leaving the acknowledged joiner
     holding a match id that 404s on every subsequent request.
-15. **Queue entries never expire without polling** (cancel suite). The
-    10s bot deadline is only evaluated when the queued user polls, so an
-    hour-gone user is still matchable into a **ghost match**; because the
-    ghost never polled, presence reports them connected forever and the
-    live player can't even get a give-up auto-tie.
+15. **Queue entries never expire without polling** (cancel suite; now also
+    xfail in the multiplayer stress suite). The 10s bot deadline is only
+    evaluated when the queued user polls, so an hour-gone user is still
+    matchable into a **ghost match**; because the ghost never polled,
+    presence reports them connected forever and the live player can't even
+    get a give-up auto-tie. Pinned as a strict xfail by
+    `test_hour_stale_queue_entry_should_not_be_matchable`, plus stress
+    tests showing the first of five fresh arrivals is the one sacrificed
+    to the ghost.
 
 **P1 — gameplay correctness bugs users will hit** (continued)
 
-24. **Unbounded integer power hangs answer grading (DoS)** (xfail, math
+24. **Unbounded integer power hangs answer grading (DoS)** (two xfails, math
     suite). `submit_answer` maps `^`→`**` and calls `parse_expr(...,
     evaluate=True)` with no timeout or size guard. A single answer of
     `9**9**9` forces Python to materialize `9**387420489` — an integer with
@@ -136,6 +155,17 @@ passing tests that assert the broken behavior.
     whole server) with one POST. Pinned by
     `test_unbounded_integer_power_answer_does_not_hang_grading`, which runs
     grading in a watchdog subprocess and fails because it never finishes.
+    The same wedge has a **second entry point**: the grader's numeric
+    fallback substitutes a random point from `uniform(1, 10)` into the
+    user's expression and evaluates it with `N()`, so a symbolic power
+    tower like `x**x**x**x**x` — which sails through the whole symbolic
+    cascade — hangs mpmath whenever the sample point lands above ~2
+    (roughly 85% of requests; the rest grade wrong normally). Pinned by
+    `test_power_tower_should_not_hang_numeric_fallback_at_large_sample_points`
+    (xfail, sample point pinned to 9.0) with a deterministic passing
+    companion at a pinned small sample point. This probabilistic variant
+    was discovered when the tower input intermittently hung the full-suite
+    run itself.
 
 **P2 — robustness, consistency and policy gaps**
 
@@ -181,6 +211,16 @@ passing tests that assert the broken behavior.
     credentials, so every state-changing route (`friend/create`, `start`,
     `answer`, …) returns 200 to a fully anonymous caller instead of
     challenging with 401. Pinned by `test_anonymous_state_change_should_be_401`.
+27. **Pending-challenge list silently truncates at 10 with no dedupe or
+    cap on creation** (xfail, multiplayer stress suite). One challenger
+    can stack unlimited identical pending challenges (12 verified, all
+    stored), but `get_pending_challenges` is a bare `to_list(length=10)`
+    with no paging, count or dedupe — the invitee sees exactly the 10
+    oldest and has no way to know (or clear) the hidden ones, which stay
+    live in the DB and playable (bug 9). Pinned by
+    `test_pending_list_should_expose_all_twelve_spam_challenges`, with
+    passing pins for the spam storage, the cap, and hidden challenges
+    scrolling into view as older ones are accepted/cancelled.
 
 ### Recommended fix order
 
@@ -208,26 +248,30 @@ passing tests that assert the broken behavior.
 7. **Bound the answer grader** (bug 24): before `parse_expr`, reject or
    cap unevaluated integer powers (or grade with `evaluate=False` /
    `Pow(..., evaluate=False)` + a numeric comparison, or run grading with a
-   wall-clock timeout). This is a one-request DoS and should jump the queue.
+   wall-clock timeout). The bound must also cover the numeric fallback's
+   `subs`/`N()` evaluation — a symbolic power tower reaches the same hang
+   through that path. This is a one-request DoS and should jump the queue.
 8. **Unify the two graders** (bug 25): have `submit_answer` reuse
    `check_math_equivalence` (or at least share the same unicode-normalization
    table) so `×`/`∗`/`·` behave identically in PvP and daily challenges.
-9. **Sweep the rest** (bugs 13, 16–23, 26): in-memory code-collision check,
-   ELO floor and overflow guard, code-case normalization, self-challenge
-   rejection, challenge memory fallback (including `cancel_challenge`),
-   an access review of `/matches/all` and the anonymous status poller,
-   TTL/cleanup for `cancelled_users` and cancel-orphaned rounds/locks,
-   replacing the `is_opponent_bot` substring check with the
-   `"bot-opponent"` sentinel, and adding real authentication so the
-   people-match routes return 401 instead of guest-fallback 200.
+9. **Sweep the rest** (bugs 13, 16–23, 26, 27): in-memory code-collision
+   check, ELO floor and overflow guard, code-case normalization,
+   self-challenge rejection, challenge memory fallback (including
+   `cancel_challenge`), an access review of `/matches/all` and the
+   anonymous status poller, TTL/cleanup for `cancelled_users` and
+   cancel-orphaned rounds/locks, replacing the `is_opponent_bot` substring
+   check with the `"bot-opponent"` sentinel, adding real authentication so
+   the people-match routes return 401 instead of guest-fallback 200, and
+   deduping / paging the pending-challenge list (plus a per-user cap on
+   open friend matches and pending challenges).
 
 ### How to run the tests
 
 ```bash
-# Full suite (831 tests: 803 pass, 28 xfail)
+# Full suite (832 tests: 803 pass, 29 xfail)
 python3 -m pytest tests/ -q
 
-# Edge-case campaign only (795 tests: 767 pass, 28 xfail)
+# Edge-case campaign only (796 tests: 767 pass, 29 xfail)
 python3 -m pytest tests/test_ranked_matchmaking_edge_cases.py \
   tests/test_friend_match_edge_cases.py \
   tests/test_challenge_match_edge_cases.py \
@@ -248,11 +292,11 @@ python3 -m pytest tests/test_ranked_matchmaking_edge_cases.py \
 python3 -m pytest --collect-only -q tests/
 ```
 
-Note: `test_match_math_equivalence_in_pvp_edge_cases.py` includes one
-DoS-detection test that grades an answer inside a watchdog **subprocess**
+Note: `test_match_math_equivalence_in_pvp_edge_cases.py` includes two
+DoS-detection tests that grade an answer inside a watchdog **subprocess**
 (spawn context) so a hang in the SymPy grader cannot wedge the whole run;
-it adds ~12s (the watchdog timeout) to that file. The rest of the suite is
-sub-second.
+they add ~25s (two 12s watchdog timeouts plus the harness sanity check) to
+that file. The rest of the suite is sub-second.
 
 All xfails are `strict`, so a fixed bug will surface as `XPASS` and fail
 the run — flip the corresponding test to a plain assertion when fixing.
@@ -1237,7 +1281,7 @@ add/rename/drop fails a test:
 
 ## PvP math equivalence (`tests/test_match_math_equivalence_in_pvp_edge_cases.py`)
 
-116 tests (114 pass, 2 strict `xfail`). Every answer is graded through the
+117 tests (114 pass, 3 strict `xfail`). Every answer is graded through the
 real `/api/game/answer` path (the inline SymPy cascade in `submit_answer`),
 not the standalone `check_math_equivalence`. A `derivative_question` fixture
 fixes the stored answer to the server form `2·x`; an `evaluate_at_question`
@@ -1256,7 +1300,24 @@ False` and an integer answer) drives the numeric-tolerance branch.
    `test_grade_with_timeout_harness_reports_finish_for_normal_answer`,
    proves the watchdog reports 200 for a normal answer.
 
-2. **`×`/`∗` rejected in PvP but accepted by the daily-challenge checker
+2. **Power-tower answers hang the numeric fallback — DoS, second entry
+   point (bug 24).**
+   `test_power_tower_should_not_hang_numeric_fallback_at_large_sample_points`
+   (xfail). `x**x**x**x**x` passes the entire symbolic cascade quickly
+   (every step returns False), but the last-resort numeric fallback
+   substitutes `random.uniform(1, 10)` for `x` and calls `N()` on the
+   result. The tower is astronomically large for sample points above ~2 —
+   mpmath grinds forever at 2.5 and everywhere in [7, 10], raises
+   `MemoryError`/`OverflowError` in between, and only completes below ~2 —
+   so roughly 85% of such submissions wedge the worker exactly like
+   `9**9**9`. The xfail pins `uniform` to 9.0 inside a spawn-subprocess
+   watchdog for determinism;
+   `test_power_tower_answer_graded_wrong_when_sampled_at_small_point`
+   (passing) pins 1.5 to show the benign outcome. (Found the hard way:
+   this input previously sat in the "pathological but safe" parametrize
+   list and intermittently hung the whole suite run.)
+
+3. **`×`/`∗` rejected in PvP but accepted by the daily-challenge checker
    (bug 25).** `test_times_sign_should_be_accepted_in_pvp` (xfail): `2×x`
    is graded wrong because `submit_answer` normalizes only `·`. Current
    behavior is pinned by
@@ -1298,11 +1359,141 @@ False` and an integer answer) drives the numeric-tolerance branch.
   `ask_for_derivative_only: false` and `evaluate_at: 3`.
 - **Pathological SymPy inputs return 200 graded-wrong** (never 500):
   unbalanced/bare operators (`(`, `*`, `**`), `x..2`, quoted answers,
-  `1/0`/`x/0`, `factorial(50000)`, symbolic towers `x**x**x**x**x`,
-  complex `sqrt(-4)*x*I/1`, large symbolic exponents `x**(10**6)`, and the
-  infinities `oo`/`zoo`/`nan`. The broad `except (SympifyError, Exception)`
-  swallows every failure — which is exactly why the one input that *hangs*
-  rather than *raises* (`9**9**9`, bug 24) is so dangerous.
+  `1/0`/`x/0`, `factorial(50000)`, complex `sqrt(-4)*x*I/1`, large
+  symbolic exponents `x**(10**6)`, and the infinities `oo`/`zoo`/`nan`.
+  The broad `except (SympifyError, Exception)` swallows every failure —
+  which is exactly why the inputs that *hang* rather than *raise*
+  (`9**9**9` in the parser, `x**x**x**x**x` in the numeric fallback,
+  bug 24) are so dangerous.
+
+## Multiplayer stress & sequential chaos (`tests/test_match_multiplayer_stress_edge_cases.py`)
+
+54 tests (50 pass, 4 strict `xfail`). Where the other suites isolate one
+endpoint, this one simulates *populations*: waves of guests hitting the
+queue at once, one user spamming parallel requests, chaotic cancel/start
+churn, spam of friend matches and challenges, full matches played
+end-to-end, and long-timeline flows (complete → requeue → rematch).
+Simultaneity is driven by `asyncio.gather` over the route coroutines
+(single-worker semantics — the guest-id pairing path has no await between
+queue check and pop, so the loop serializes it exactly as one uvicorn
+worker would) and by rapid sequential HTTP calls for the endpoint-level
+flows.
+
+### Bugs (xfail tests)
+
+1. **Churn makes a whole cohort unmatchable for two extra rounds of
+   polling** — `test_churned_users_should_all_be_matchable_on_first_mass_start`
+   (xfail; population-level face of the stale-cancel-flag bug 6). After 5
+   users each rapidly start+cancel a few times, a full mass re-queue forms
+   **zero** matches: the leftover flags eat every pairing pairwise, users
+   who never cancelled *last* still receive `{"status": "cancelled"}`, and
+   the queue is left holding one user. Pinned step by step by
+   `test_current_behavior_first_mass_start_after_churn_pairs_nobody`
+   (pass 1: `searching/cancelled/searching/cancelled/searching`, zero
+   matches) and
+   `test_current_behavior_second_mass_start_finally_forms_two_matches`
+   (pass 2 finally pairs (u3,u2) and (u5,u4), while u1 eats one more bogus
+   "cancelled" and ends up matchless).
+
+2. **Pending-challenge list truncates spam at 10 with no dedupe** (bug 27)
+   — `test_pending_list_should_expose_all_twelve_spam_challenges` (xfail).
+   12 identical challenges from one challenger are all stored (no cap, no
+   dedupe — `test_twelve_identical_challenges_all_stored_no_dedupe`), but
+   the invitee's list is a bare `to_list(length=10)`: exactly the 10
+   oldest, no paging, no total. The hidden two only scroll into view as
+   older ones are accepted or cancelled
+   (`test_cancelling_spam_challenges_uncovers_the_hidden_ones`).
+
+3. **An overlapping pair cannot queue for ranked** —
+   `test_overlapping_pair_should_be_able_to_queue_ranked_from_friend_match`
+   (xfail; pair-level face of the match_type-blind reconnect, bug 7). With
+   a fresh (<5s) active friend match, *both* players tapping "play ranked"
+   are answered `matched` with the **friend** match id; neither enters the
+   queue and no ranked match can form. Pinned by
+   `test_current_behavior_ranked_start_hijacks_fresh_friend_match_for_both`;
+   the >5s flavor
+   (`test_current_behavior_ranked_start_abandons_older_friend_match_then_pairs`)
+   shows the friend match being silently abandoned and the pair dropped
+   into a fresh ranked match instead.
+
+4. **Hour-stale queue entries are still matchable** —
+   `test_hour_stale_queue_entry_should_not_be_matchable` (xfail; bug 15
+   promoted to a strict xfail). With one user queued 3600s ago and five
+   fresh arrivals, the first arrival is sacrificed into a ghost match with
+   the long-gone user
+   (`test_hour_stale_waiter_is_paired_first_then_arrivals_pair_among_themselves`),
+   the never-polling ghost is reported `opponent_connected: true`
+   (`test_ghost_match_reports_never_polling_opponent_as_connected`), and
+   the live player's give-up cannot auto-tie
+   (`test_ghost_opponent_blocks_the_give_up_auto_tie`). If the "ghost" was
+   merely slow and polls within 5s, the reconnect window does route them
+   into the ghost match
+   (`test_long_waiter_polling_right_after_ghost_creation_reconnects_into_it`).
+
+### Simultaneous-arrival semantics (asserted in passing tests)
+
+- **10 guests at once → exactly 5 matches, empty queue, no cross-pairing.**
+  Arrivals alternate searching/matched; every user lands in exactly one
+  match, every match is a distinct 2-player pair (no triple-matching, no
+  bot, no self-match), and the five users initially answered "searching"
+  are all reconnected into their match on the next poll with no duplicate
+  matches created. An odd cohort (9) leaves exactly the last arrival
+  genuinely queued. The same invariants hold over rapid sequential HTTP
+  polls.
+- **One user spamming 8 parallel starts** holds exactly one queue slot,
+  never self-matches, and re-polls do not reset the queue timer
+  (`joined_at` is written once). Once matched, 5 parallel start calls all
+  reconnect into the same single match.
+
+### Create/join spam (passing tests)
+
+- 20 friend matches from 20 creators get 20 unique codes/ids; **a single
+  creator can also stack 20 waiting matches** (no per-user cap — memory/DB
+  spam vector, cross-referenced with the cancel-suite leak findings).
+  Random joins activate exactly the targeted matches (each joiner becomes
+  player2 of their own match only), a second joiner on a taken code gets
+  `400 "Match already started"` and does not evict the first, and
+  untouched matches remain waiting and joinable afterwards.
+
+### Full-match and rematch flows (passing tests)
+
+- A first-to-3 friend match with alternating winners lands at 3-2 with the
+  scores stepping exactly (1,0),(1,1),(2,1),(2,2),(3,2); both players
+  always see the same round id before answering; round ids run
+  `round-<match>-1..5`; wrong-answer flurries neither score nor advance
+  the round; completion pays `elo_change: 0` (friend matches are
+  unranked), and both players get 400 on any further question/answer.
+- Two ranked matches in parallel never share state: distinct
+  deterministic round ids per match, a win in one moves nothing in the
+  other, rounds progress independently (match 1 on round 3 while match 2
+  still sits on round 1), and both complete independently with the
+  standard (phantom-for-guests) 20 ELO.
+- After a completed ranked match, the <5s reconnect window correctly
+  ignores the completed match; both players immediately requeue and
+  rematch into a fresh match (new id, new code, 0-0), the old match stays
+  frozen, and `/api/game/active` points both at the rematch.
+
+### Storm behavior (passing tests)
+
+- **Give-up storms**: solo spam keeps returning
+  `{"status": "gave_up", "waiting_for_opponent": true}` without resolving
+  the round; the opposite player's give-up then ties it at 0-0; post-tie
+  spam from both sides returns `already_ended`; three full rounds of
+  mutual give-up storms leave the match active at 0-0 (ties can never
+  finish a first-to-3) with round ids advancing 1→2→3; and a quitter can
+  still snipe the round with a correct answer after their own give-up
+  storm (quirk shared with the answer suite).
+- **Status-poll storms**: 15 alternating polls with wrong answers mixed in
+  never mutate scores, never fork the round (`in_memory_rounds` stays at
+  1), and echo a byte-identical `round_start_time` every time; presence
+  stays `opponent_connected: true` in both directions throughout; after a
+  round win, both pollers see the same winner/score state on every
+  subsequent poll; 20 polls between rounds change nothing until the next
+  question advances to round 2 exactly once.
+- **Friend + ranked overlap** (in the safe order, ranked first): one pair
+  can hold both an active ranked and an active friend match, score in
+  each without cross-credit, while `/api/game/active` reports only the
+  older (ranked) match.
 
 ## Auth identity & match ownership (`get_current_user`, `tests/test_match_auth_identity_edge_cases.py`)
 
