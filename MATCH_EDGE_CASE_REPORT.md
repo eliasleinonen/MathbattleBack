@@ -11,15 +11,19 @@ presence tracking and give-up resolution, question serving and round
 progression, answer grading and first-to-3 win conditions, ELO calculation
 and payout, datetime/timezone handling, in-memory-vs-Mongo state
 divergence, and cross-match isolation / access control, plus dedicated
-suites for the bot fallback / bot round timing path and the cancel-flag /
-queue lifecycle. Concurrency races, DB-unavailable fallbacks, cache
-eviction/restart scenarios, and malformed input were exercised throughout.
+suites for the bot fallback / bot round timing path, the cancel-flag /
+queue lifecycle, the HTTP API contract (response-key shapes, status-code
+matrix, content-type/method negotiation, injection/long-input hardening),
+and PvP math-equivalence grading (equivalent/inequivalent answer forms,
+unicode operators, numeric tolerance, and SymPy crash/DoS inputs).
+Concurrency races, DB-unavailable fallbacks, cache eviction/restart
+scenarios, and malformed input were exercised throughout.
 
 ### Test inventory
 
-Eleven dedicated edge-case suites, **508 tests collected** (verified with
-`pytest --collect-only -q`), currently running as **487 passed,
-21 xfailed** — every xfail is strict and pins a real bug documented below.
+Thirteen dedicated edge-case suites, **704 tests collected** (verified with
+`pytest --collect-only -q`), currently running as **680 passed,
+24 xfailed** — every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail |
 |---|---|---|
@@ -34,10 +38,12 @@ Eleven dedicated edge-case suites, **508 tests collected** (verified with
 | `tests/test_match_isolation_and_access_edge_cases.py` | 38 | 2 |
 | `tests/test_bot_fallback_and_timeout_edge_cases.py` | 28 | 1 |
 | `tests/test_match_cancel_and_queue_lifecycle_edge_cases.py` | 25 | 4 |
-| **Total** | **508** | **21** |
+| `tests/test_match_api_contract_edge_cases.py` | 80 | 1 |
+| `tests/test_match_math_equivalence_in_pvp_edge_cases.py` | 116 | 2 |
+| **Total** | **704** | **24** |
 
 The full repository suite (including pre-existing tests) collects
-544 tests and runs as 523 passed, 21 xfailed.
+740 tests and runs as 716 passed, 24 xfailed.
 
 ### Severity-ranked bug list
 
@@ -117,6 +123,18 @@ passing tests that assert the broken behavior.
     ghost never polled, presence reports them connected forever and the
     live player can't even get a give-up auto-tie.
 
+**P1 — gameplay correctness bugs users will hit** (continued)
+
+24. **Unbounded integer power hangs answer grading (DoS)** (xfail, math
+    suite). `submit_answer` maps `^`→`**` and calls `parse_expr(...,
+    evaluate=True)` with no timeout or size guard. A single answer of
+    `9**9**9` forces Python to materialize `9**387420489` — an integer with
+    ~370 million digits — so the request never returns and pins the worker's
+    CPU/memory. Any player can wedge a match (and, on a single worker, the
+    whole server) with one POST. Pinned by
+    `test_unbounded_integer_power_answer_does_not_hang_grading`, which runs
+    grading in a watchdog subprocess and fails because it never finishes.
+
 **P2 — robustness, consistency and policy gaps**
 
 16. **User ELO can go negative** (xfail, ELO suite) — the loser `$inc`
@@ -147,6 +165,20 @@ passing tests that assert the broken behavior.
     `/match/{code}` labels any opponent whose id contains `"bot"` (e.g.
     `guest-abbot-1234`) as a bot, while gameplay correctly treats them as
     human; the real sentinel is `player2_id == "bot-opponent"`.
+25. **Unicode-operator handling diverges between the two graders** (xfail,
+    math suite). `submit_answer`'s inline preprocess maps only the middle
+    dot `·` to `*`, so the multiplication sign `2×x` (and the asterisk
+    operator `2∗x`) is graded **wrong** in PvP — yet the standalone
+    `check_math_equivalence` (used by the daily-challenge path) maps both
+    `·` and `×`, so the identical answer passes there. Same keystroke, two
+    verdicts. Pinned by `test_times_sign_should_be_accepted_in_pvp` plus a
+    passing test showing `check_math_equivalence("2·x", "2×x")` is `True`.
+26. **No 401 on the people-match routes** (xfail, API-contract suite; same
+    root cause as bug 1 / bug 21). `get_current_user` silently falls back
+    to a shared guest identity for missing, empty, malformed or wrong-scheme
+    credentials, so every state-changing route (`friend/create`, `start`,
+    `answer`, …) returns 200 to a fully anonymous caller instead of
+    challenging with 401. Pinned by `test_anonymous_state_change_should_be_401`.
 
 ### Recommended fix order
 
@@ -171,21 +203,29 @@ passing tests that assert the broken behavior.
    with the same `round_count + 1` used for the round doc.
 6. **Harden datetime handling** (bug 12): run `created_at` through
    `ensure_utc`/`parse_round_start` in the reconnect window.
-7. **Sweep the rest** (bugs 13, 16–23): in-memory code-collision check,
+7. **Bound the answer grader** (bug 24): before `parse_expr`, reject or
+   cap unevaluated integer powers (or grade with `evaluate=False` /
+   `Pow(..., evaluate=False)` + a numeric comparison, or run grading with a
+   wall-clock timeout). This is a one-request DoS and should jump the queue.
+8. **Unify the two graders** (bug 25): have `submit_answer` reuse
+   `check_math_equivalence` (or at least share the same unicode-normalization
+   table) so `×`/`∗`/`·` behave identically in PvP and daily challenges.
+9. **Sweep the rest** (bugs 13, 16–23, 26): in-memory code-collision check,
    ELO floor and overflow guard, code-case normalization, self-challenge
    rejection, challenge memory fallback (including `cancel_challenge`),
    an access review of `/matches/all` and the anonymous status poller,
    TTL/cleanup for `cancelled_users` and cancel-orphaned rounds/locks,
-   and replacing the `is_opponent_bot` substring check with the
-   `"bot-opponent"` sentinel.
+   replacing the `is_opponent_bot` substring check with the
+   `"bot-opponent"` sentinel, and adding real authentication so the
+   people-match routes return 401 instead of guest-fallback 200.
 
 ### How to run the tests
 
 ```bash
-# Full suite (544 tests: 523 pass, 21 xfail)
+# Full suite (740 tests: 716 pass, 24 xfail)
 python3 -m pytest tests/ -q
 
-# Edge-case campaign only (508 tests: 487 pass, 21 xfail)
+# Edge-case campaign only (704 tests: 680 pass, 24 xfail)
 python3 -m pytest tests/test_ranked_matchmaking_edge_cases.py \
   tests/test_friend_match_edge_cases.py \
   tests/test_challenge_match_edge_cases.py \
@@ -196,11 +236,19 @@ python3 -m pytest tests/test_ranked_matchmaking_edge_cases.py \
   tests/test_match_datetime_and_memory_edge_cases.py \
   tests/test_match_isolation_and_access_edge_cases.py \
   tests/test_bot_fallback_and_timeout_edge_cases.py \
-  tests/test_match_cancel_and_queue_lifecycle_edge_cases.py -q
+  tests/test_match_cancel_and_queue_lifecycle_edge_cases.py \
+  tests/test_match_api_contract_edge_cases.py \
+  tests/test_match_math_equivalence_in_pvp_edge_cases.py -q
 
 # Verify the inventory
 python3 -m pytest --collect-only -q tests/
 ```
+
+Note: `test_match_math_equivalence_in_pvp_edge_cases.py` includes one
+DoS-detection test that grades an answer inside a watchdog **subprocess**
+(spawn context) so a hang in the SymPy grader cannot wedge the whole run;
+it adds ~12s (the watchdog timeout) to that file. The rest of the suite is
+sub-second.
 
 All xfails are `strict`, so a fixed bug will surface as `XPASS` and fail
 the run — flip the corresponding test to a plain assertion when fixing.
@@ -1090,3 +1138,164 @@ yield) to force deterministic interleavings.
   no ghost match is created and all flags are consumed. A cancel landing
   *before* the scan simply leaves the joiner searching, with the
   canceller's flag lingering (feeding bugs 1/2).
+
+## API contract (`tests/test_match_api_contract_edge_cases.py`)
+
+80 tests (79 pass, 1 strict `xfail`). This suite nails down the *shape* of
+every people-match endpoint — exact response-key sets, the status-code
+matrix for misuse, content-type/body handling, pydantic extra-field and
+coercion behavior, path-injection/long-input hardening, and method
+negotiation — independent of gameplay semantics. Friend matches back the
+member-only checks; a small in-memory `matches_collection` fake backs the
+challenge accept/cancel/pending contracts.
+
+### Bug (xfail)
+
+- **No 401 path (bug 26).** `test_anonymous_state_change_should_be_401`
+  (xfail): `POST /api/game/friend/create` with **no** `Authorization`
+  header returns 200 (creating a match owned by the shared guest identity)
+  instead of 401. Same root cause as the unauthenticated-exposure findings
+  (bugs 1/21). Current behavior is pinned by
+  `test_missing_or_bad_credentials_never_401_current_behavior`, which shows
+  a missing header, a garbage bearer, an empty bearer and a `Basic` scheme
+  all yield `200 {"has_active_match": false}`.
+
+### Response-key contracts (asserted in passing tests)
+
+Exact key sets are locked for every endpoint, so a silent field
+add/rename/drop fails a test:
+
+- `friend/create` → `{match_id, match_code, link, status}` (6-char code,
+  `status: "waiting"`, code embedded in the link).
+- `friend/join` → `{match_id, status}` (`active`).
+- `friend/status/{code}` → `{match_id, status, player1_ready,
+  player2_ready}`.
+- `game/active` → `{has_active_match}` when idle, and adds
+  `{match_id, match_type, opponent}` when a match is live.
+- `game/cancel` → `{status}`.
+- `game/question` → `{round_id, expression, evaluate_at,
+  ask_for_derivative_only, round_start_time}` (human matches have **no**
+  `time_limit`; bot matches add it — see the bot suite).
+- `game/answer` → `{correct, round_winner, player1_score, player2_score,
+  match_winner, elo_change}` in progress, plus `already_won` once the round
+  has a winner.
+- `give-up` → `{status, waiting_for_opponent}` (lone), `{status,
+  round_winner, player1_score, player2_score}` (both), `{status,
+  round_winner}` (already ended).
+- `game/status/{id}` → the 16-key polling payload including
+  `opponent_connected`, `round_start_time`, both `*_gave_up` flags and
+  `winner_id`.
+- `game/match/{code}` → `{match_id, status, player1_id, player2_id,
+  player1_score, player2_score, current_round, is_player1, opponent_name,
+  is_opponent_bot}`.
+- `challenges/pending` → list of `{match_id, match_code, challenger,
+  created_at}`; `accept` → `{match_id, match_code, status}`; `cancel` →
+  `{status}`.
+
+### Status-code matrix (asserted in passing tests)
+
+- **404** — unknown `match_id` on question/answer/give-up/status; unknown
+  code on join/friend-status/match-by-code; unknown challenge id on
+  accept/cancel.
+- **403** — a non-participant on question/answer/give-up/status/match-by-code;
+  the wrong actor on challenge accept (only player2) / cancel (only
+  player1). Note the 403-vs-404 split is an existence oracle: an outsider
+  gets 403 for a real match id but 404 for a fake one.
+- **400** — question/answer on a completed match; joining an
+  already-started match or your own match; and `answer`/`give-up` before
+  anyone has fetched a question return 404 `"No active round"`.
+- **422** — missing body; missing/`null`/int `match_id`; missing/`null`/
+  list/dict `answer`; missing/non-string `mode`; missing query `match_id`
+  on question/give-up.
+- **No 401 anywhere** (see the bug above).
+
+### Content-type, extra fields, coercion (asserted in passing tests)
+
+- Missing JSON body, form-encoded body, a JSON payload sent as
+  `text/plain`, and malformed JSON are all **422** (pydantic never sees a
+  valid model).
+- **Extra unknown fields are silently ignored** (the models don't set
+  `extra="forbid"`): `start` and `answer` accept and drop bogus keys.
+- **Coercion follows pydantic**: `continue_existing: "true"` is accepted,
+  `"maybe"` is 422; `answer` is `Union[str, float]` so a JSON number is
+  valid input (graded via the numeric branch).
+
+### Injection / long input / methods (asserted in passing tests)
+
+- Weird `match_id` path segments (spaces, encoded null bytes, traversal-ish
+  `..`, `;`/`|`/`<script>`/SQL-ish), unicode ids, encoded slashes, and
+  injection-looking match codes on join all return **404/422, never 500**.
+- Very long `match_id` (up to 50k) and `match_code` (up to 50k on join, 5k
+  on the status path) all 404 without crashing.
+- Wrong HTTP methods return **405** with a populated `Allow` header
+  (GET on `/answer`, PUT on `/start`, DELETE on `friend/create`, POST on
+  `/active` and `/question`, GET on the challenge action routes, etc.).
+
+## PvP math equivalence (`tests/test_match_math_equivalence_in_pvp_edge_cases.py`)
+
+116 tests (114 pass, 2 strict `xfail`). Every answer is graded through the
+real `/api/game/answer` path (the inline SymPy cascade in `submit_answer`),
+not the standalone `check_math_equivalence`. A `derivative_question` fixture
+fixes the stored answer to the server form `2·x`; an `evaluate_at_question`
+fixture (monkeypatching `generate_question` with `ask_for_derivative_only:
+False` and an integer answer) drives the numeric-tolerance branch.
+
+### Bugs (xfail)
+
+1. **Unbounded integer power hangs grading — DoS (bug 24).**
+   `test_unbounded_integer_power_answer_does_not_hang_grading` (xfail).
+   The grader replaces `^`→`**` and calls `parse_expr(..., evaluate=True)`,
+   so `9**9**9` makes Python evaluate `9**387420489` (a ~370-million-digit
+   integer) with no timeout — the request never returns. The test grades in
+   a **spawn subprocess** with a 12s watchdog and asserts it finished; it
+   doesn't, so the xfail holds without wedging the run. A companion,
+   `test_grade_with_timeout_harness_reports_finish_for_normal_answer`,
+   proves the watchdog reports 200 for a normal answer.
+
+2. **`×`/`∗` rejected in PvP but accepted by the daily-challenge checker
+   (bug 25).** `test_times_sign_should_be_accepted_in_pvp` (xfail): `2×x`
+   is graded wrong because `submit_answer` normalizes only `·`. Current
+   behavior is pinned by
+   `test_alternate_unicode_multiplication_is_rejected_current_behavior`
+   (`2×x`, `2∗x`, `2✕x` all wrong) and
+   `test_check_math_equivalence_accepts_times_sign_unlike_pvp` (the helper
+   returns `True` for the same string).
+
+### Grading behavior (asserted in passing tests)
+
+- **Accepted equivalents** for `2·x`: `2*x`, `2x`, `2 * x`, padded `  2x  `,
+  `x*2`, `x 2`, `x2`, `2·x`, `(2)(x)`/`(x)(2)`/`2(x)`, deep nesting
+  `((((2x))))`, `+2x`, `2x*1`, `2x/1`, `x*x/x*2`, `2*x + 0`; fractions
+  `4x/2`, `6x/3`, `x/(1/2)`, `10*x/5`, `(4/2)*x`; and generous rewrites
+  `sqrt(4)*x`, `√4*x`, `2.0x`, `2ex/e`, `x+x`.
+- **The grader evaluates arbitrary SymPy calls** in answers: `diff(x^2,
+  x)`, `Derivative(x^2, x)`, `diff(x**2)`, `integrate(2, x)`,
+  `exp(log(2x))`, the trig identity `2*x*sin(x)**2 + 2*x*cos(x)**2`,
+  `cancel((2x**2)/x)`, `simplify(4*x/2)` are all accepted — worth knowing
+  the answer box is a small CAS, not an algebra-only field. Relatedly,
+  SymPy treats `#` as a comment, so `2x #comment` grades as `2x`.
+- **Rejected near-misses / wrong math**: `2`, `x`, `-2*x`, `2*x + 1`,
+  `x^2`, `2*x^2`, `2/x`, `3*x`, `x/2`; python-but-wrong `2**x`, `x**2`,
+  `0x2` (hex → 2), `2y`, `2*X` (capital `X` is a distinct symbol),
+  `idiff(x^2, x)`, `e**log(2x)` and `ln(e^(2x))` (SymPy's `e` is a plain
+  symbol, not Euler's number, so these don't reduce to `2x`).
+- **Junk around the answer** (`2x;`, `answer is 2x`, `2x!`, `d/dx(x^2)`,
+  `= 2x`, `2x)))))`, free-text) is graded wrong, never 500.
+- **Code-injection-looking answers** (`__import__('os').system('id')`,
+  `open('/etc/passwd').read()`, `eval(...)`, `exec(...)`, `lambda: 2*x`,
+  `Symbol('x')*2`, `[].__class__...`) are graded wrong **without
+  executing** — no RCE, no crash.
+- **Numeric (evaluate_at) branch**: with stored answer `6`, `abs(diff) <
+  0.1` accepts `6`, `6.0`, `"6"`, `"6.0"`, `" 6 "`, `"6\n"`, `"0006"`,
+  `"6e0"`, `6.05`, `5.95`; rejects `6.2`, `6.5`, `5.5`, `-6`, `0`, `"six"`,
+  `"2*3"` (the numeric branch does **not** evaluate expressions —
+  `float("2*3")` raises), `"inf"`, `"nan"`, empty/whitespace, and JSON
+  `true` (coerced to `1.0`). The question payload correctly advertises
+  `ask_for_derivative_only: false` and `evaluate_at: 3`.
+- **Pathological SymPy inputs return 200 graded-wrong** (never 500):
+  unbalanced/bare operators (`(`, `*`, `**`), `x..2`, quoted answers,
+  `1/0`/`x/0`, `factorial(50000)`, symbolic towers `x**x**x**x**x`,
+  complex `sqrt(-4)*x*I/1`, large symbolic exponents `x**(10**6)`, and the
+  infinities `oo`/`zoo`/`nan`. The broad `except (SympifyError, Exception)`
+  swallows every failure — which is exactly why the one input that *hangs*
+  rather than *raises* (`9**9**9`, bug 24) is so dangerous.
