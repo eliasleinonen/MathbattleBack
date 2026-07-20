@@ -50,3 +50,8 @@ htmlcov/
 
 # Ignore runtime.txt if not needed
 runtime.txt
+
+# Markdown files (except README.md)
+*.md
+!README.md
+
