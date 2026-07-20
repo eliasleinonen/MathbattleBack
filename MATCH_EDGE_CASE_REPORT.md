@@ -523,3 +523,178 @@ for the test's event loop).
   stamped on the match before the round doc is built, so it survives the
   crash. The match fully recovers: the next poll with a healthy generator
   creates round 1 normally.
+
+## Datetime handling & in-memory vs Mongo state (`ensure_utc`, `parse_round_start`, hydrate paths, `match_counter`)
+
+Findings from `tests/test_match_datetime_and_memory_edge_cases.py` (46 tests:
+43 pass, 3 strict `xfail` documenting real bugs). DB hydrate paths were
+exercised with in-process fakes of `matches_collection.find_one` /
+`rounds_collection.find_one` that return Mongo-shaped documents (naive
+datetimes, no `player_last_seen`, deep copy per call).
+
+### Bugs (xfail tests)
+
+1. **Aware `created_at` turns `/api/game/start` into a 500** —
+   `test_aware_created_at_should_still_reconnect` (xfail). The reconnect
+   window computes `datetime.utcnow() - match["created_at"]` with no
+   `ensure_utc`, so an aware timestamp (a doc migrated to `utc_now()`, or a
+   Mongo client configured with `tz_aware=True`) raises `TypeError`, which
+   the global handler converts to a generic 500 for that player on every
+   subsequent start poll. An ISO-**string** `created_at` fails the same way.
+   Pinned by `test_current_behavior_aware_created_at_500s_the_start_endpoint`
+   and `..._string_created_at_also_500s...`. A *missing* `created_at` is
+   fine (defaults to "now" → age 0 → reconnect).
+
+2. **Memory wipe restarts round numbering and replays round ids** —
+   `test_rehydrated_match_should_not_reuse_historical_round_ids` (xfail).
+   On a DB hit for a match that fell out of memory, `get_question` hydrates
+   the match doc but never its current round; `_create_next_round` counts
+   rounds from `in_memory_rounds` only, ignoring both the match doc's
+   `current_round_id` and everything persisted in Mongo. The resumed match
+   therefore issues `round-…-1` again; the insert is skipped because that id
+   already exists in the DB, leaving memory (new question) and Mongo (old
+   question, old winner) permanently diverged under one round id. Scores
+   survive (they live on the match doc). Pinned by
+   `test_current_behavior_memory_wipe_restarts_round_numbering`.
+
+3. **`match_counter` restart collision overwrites live matches** —
+   `test_match_ids_should_survive_counter_restart` (xfail). Ranked ids are
+   `match-{process_counter}`; after a restart the counter resets and the
+   next ranked pairing re-issues `match-1`, replacing the still-live match
+   in memory (and in Mongo via the update-instead-of-insert branch). The
+   original players then get `403 "Not your match"` on their own match id.
+   Pinned by `test_current_behavior_counter_restart_reuses_live_match_id`.
+
+### Timestamp helpers (asserted in passing tests)
+
+- `ensure_utc`: naive → same wall clock re-tagged UTC; aware input returned
+  **unchanged**, including non-UTC offsets (despite the name, `+05:00` stays
+  `+05:00`; math still works because aware-aware arithmetic normalizes).
+  Idempotent.
+- `parse_round_start`: `None`/garbage/empty-string → `None`; naive datetime
+  or naive ISO string → aware UTC; offsets preserved with the correct
+  instant. A trailing `"Z"` parses only on Python ≥3.11 (older versions
+  would return `None` and disable the timeout for JS-produced timestamps).
+  Non-str/non-datetime input (e.g. a unix timestamp float) raises
+  `AttributeError` in `ensure_utc` instead of parsing or returning `None`.
+- **Split timestamp regime**: match docs (`created_at`, `updated_at`) are
+  naive `datetime.utcnow()`, while round docs and `player_last_seen` are
+  aware `utc_now()`. The reconnect window only works because both sides of
+  its subtraction happen to be naive — see bug 1.
+- `round_start_time` is stored and served as an **aware ISO string** ending
+  `+00:00`, scheduled ~3s out, byte-identical for both players on resume and
+  echoed verbatim by `/api/game/status`; each new round gets a fresh, later
+  anchor.
+
+### 5-minute round timeout across `created_at` representations
+
+- Strict `> 300s`: exactly 300s still resumes; 300.001s ties the round and
+  advances. Aware datetimes, naive datetimes (Mongo round-trips) and ISO
+  strings all work through `parse_round_start`/`ensure_utc`.
+- **Unparseable `created_at` disables the timeout entirely**: `None` from
+  the parser short-circuits `timed_out` to `False`, so a corrupted
+  timestamp wedges the match on one question until somebody answers it.
+
+### In-memory vs DB visibility, hydrate paths
+
+- With the DB missing everything, the full lifecycle (create, join, 3
+  rounds, completion) runs from process memory. Evicting the match mid-game
+  (restart with DB down) 404s every gameplay route and `by-code`, and
+  `/api/game/active` flips to `false` — while the round doc and the match
+  lock stay orphaned in `in_memory_rounds` / `match_locks` forever (leak).
+- The same match is simultaneously invisible to `/matches/all` (DB-only)
+  and fully served by `/match/{id}/details` (memory fallback).
+- Hydrate paths: `status` caches the DB doc back into memory (presence
+  tracking then works from scratch); `question` creates round 1 for a
+  hydrated match; `answer` hydrates match **and** round and scores
+  normally; `give-up` hydrates both too. Membership (403) is enforced on
+  hydrated matches on all four routes.
+- **Presence history does not survive a wipe**: the rehydrated doc has no
+  `player_last_seen`, never-seen counts as connected, so an opponent who
+  walked away 999s ago flips back to "connected", and a give-up that would
+  have auto-tied against a stale opponent waits forever instead
+  (`test_stale_opponent_give_up_autotie_lost_after_memory_wipe`).
+
+## Cross-match isolation & access control (parallel matches, outsiders, `/matches/all`, `/match/{id}/details`)
+
+Findings from `tests/test_match_isolation_and_access_edge_cases.py`
+(38 tests: 36 pass, 2 strict `xfail` documenting real bugs). Ranked match
+codes were made deterministic by stubbing `secrets.token_urlsafe`.
+
+### Bugs (xfail tests)
+
+1. **Queueing for ranked abandons/hijacks your active friend match** —
+   `test_ranked_queueing_should_not_abandon_active_friend_match` (xfail).
+   The stale-match scan in `start_match` does not filter by `match_type`.
+   A user with an active friend match who taps "play ranked" is silently
+   "reconnected" **into the friend match** if it is <5s old (pinned by
+   `test_current_behavior_ranked_start_reconnects_into_fresh_friend_match`),
+   or has the friend match marked `abandoned` as a side effect if it is
+   older (pinned by
+   `test_current_behavior_ranked_start_abandons_older_friend_match`) — the
+   friend opponent is never told except via status polls.
+
+2. **`/match/{match_id}/details` is a live answer oracle with no authz** —
+   `test_match_details_should_reject_non_participants` (xfail). The details
+   endpoint never checks that the caller is a participant (nor that there
+   is a caller at all — no auth header works), and its response embeds the
+   persisted `rounds` array, which includes the **correct answer of the
+   still-unresolved current round** plus both players' submitted answers.
+   Anyone with the match_id — including the opponent in a second tab — can
+   read the answer mid-round. Pinned by
+   `test_current_behavior_match_details_leak_round_answers_to_outsiders`
+   and `test_match_details_needs_no_auth_at_all`.
+
+### Isolation between parallel matches (asserted in passing tests)
+
+- Two simultaneous friend matches keep fully disjoint state: deterministic
+  round ids embed the owning match (`round-{match_id}-1`), round wins,
+  give-up ties and even full completion in one match move nothing in the
+  other. The **same pair** can run two matches at once and each behaves
+  independently. `get_match_lock` hands out a distinct, stable lock object
+  per match id.
+- One user can hold a ranked and a friend match simultaneously (create the
+  ranked one first — see bug 1) and score in each without cross-credit;
+  `/api/game/active` then reports only the **oldest** active match
+  (insertion order), hiding the friend match entirely.
+- A player of match A acting on match B is an outsider there: correct
+  answers are 403 `"Not your match"` and score neither match, question
+  fetches 403 before any round is created, give-ups set no flags.
+
+### Outsider / spectator surface
+
+- On ranked matches, outsiders get 403 on `question`, `answer`, `give-up`,
+  `status` and `by-code` (`"Not authorized to access this match"`), leaving
+  zero trace: no round created, no score, no presence heartbeat.
+- But a **leaked match_id alone** still buys a spectator: `/match/{id}/details`
+  works as a live scoreboard (memory fallback, DB down included), and its
+  response reveals the `match_code`, which unlocks the unauthenticated
+  `/api/game/friend/status/{code}` poller — id → code → anonymous polling.
+- `/matches/all` returns the last 50 matches of **all** players (scores,
+  statuses) to any caller, with or without an Authorization header.
+
+### Ranked match codes vs the upper-casing friend endpoints
+
+- `/api/game/match/{code}` compares case-sensitively: the exact
+  `token_urlsafe` ranked code works for a member; the same code upper-cased
+  404s (the friend endpoints, conversely, normalize with `.upper()` — the
+  two code namespaces disagree about case).
+- A mixed-case ranked code is unreachable via `friend/join` and the
+  unauthenticated `friend/status/{code}` poller (both upper-case the input
+  first). But when `token_urlsafe` happens to emit **no lowercase letters**,
+  the ranked match becomes visible to both: join answers
+  `400 "Match already started"` (confirming existence) and the tokenless
+  status poller serves `match_id` + live status to anyone. Case mismatch is
+  the only thing keeping ranked matches out of the friend lookups.
+
+### Abandoned vs completed access differences
+
+- `completed`: `question`/`answer` are 400 (`"Match is already completed"`);
+  `give-up` is **not** blocked by status and answers `already_ended` off the
+  final round instead. `abandoned`: the same player performing the same
+  actions gets full service — new rounds, scoring, everything (zombie-match
+  bug, xfailed in the presence suite; pinned again here from the
+  access-difference angle).
+- Both terminal states are served by `/api/game/status` (verbatim status,
+  `winner_id` only for completed) and by `/api/game/match/{code}` for
+  members; both are hidden from `/api/game/active` for all four players.
