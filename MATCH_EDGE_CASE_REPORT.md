@@ -28,9 +28,9 @@ throughout.
 
 ### Test inventory
 
-21 dedicated edge-case suites, **1025 edge-case tests collected**
+22 dedicated edge-case suites, **1058 edge-case tests collected**
 (verified with `pytest --collect-only -q`). Full repository suite:
-**1061 collected → 1005 passed, 56 xfailed**.
+**1094 collected → 1037 passed, 57 xfailed**.
 Every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail markers |
@@ -55,11 +55,12 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_question_and_round_edge_cases.py` | 68 | 2 |
 | `tests/test_match_reconnect_abandon_edge_cases.py` | 35 | 1 |
 | `tests/test_match_status_gate_edge_cases.py` | 58 | 10 |
+| `tests/test_match_win_completion_edge_cases.py` | 33 | 1 |
 | `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
-| **Edge-case total** | **1025** | **56** |
+| **Edge-case total** | **1058** | **57** |
 
 The full repository suite (including pre-existing tests) collects
-1061 tests and runs as 1005 passed, 56 xfailed.
+1094 tests and runs as 1037 passed, 57 xfailed.
 
 ### Severity-ranked bug list
 
@@ -78,7 +79,11 @@ passing tests that assert the broken behavior.
    answer/scoring suite). `submit_answer` takes no match lock; on a
    round-cache miss two concurrent correct answers both win the round and
    one round pays a point to each player. Any multi-worker deployment or
-   cache eviction hits this path.
+   cache eviction hits this path. The win-completion suite pins the
+   worst case (xfail `BUG(match-point-db-race-double-elo)`): at 2-2 the
+   same race double-completes the match — 3-3 scoreline, ELO `$inc`'d
+   twice for both players, `completed` written twice, and both
+   completions credit player1.
 3. **`match_counter` restart collision overwrites live matches** (xfail,
    datetime/memory suite). Ranked ids are `match-{counter}`; after a
    process restart the counter resets, `match-1` is re-issued, and the
@@ -2307,3 +2312,102 @@ python3 -m pytest tests/ -q
 
 All ten xfails are `strict` and sit next to passing parametrized pins of
 the current behavior, matching the campaign convention.
+
+## First-to-3 win completion deep-dive (`tests/test_match_win_completion_edge_cases.py`)
+
+33 tests (32 pass, 1 strict `xfail`). A focused pass over the WIN
+COMPLETION mechanics of people-vs-people matches: every reachable
+completion scoreline, winner attribution, the one-shot nature of the
+`completed` transition, post-completion lockout, ELO single-application,
+the match-point concurrency race, and post-completion discoverability /
+rematch hygiene. With this file the full repository suite collects
+**1094 tests** and runs as **1037 passed, 57 xfailed**.
+
+### What was covered
+
+- **All completion scorelines, both match types**: 3-0, 3-1 and 3-2 are
+  played out round-by-round for friend AND ranked matches (parametrized
+  6 ways); the final answer flips `status` to `completed` and stamps
+  `winner_id` and both scores consistently in the response, the
+  in-memory doc, and the status poll.
+- **Player2 wins are attributed correctly**: a 0-3 sweep by the joiner
+  sets `winner_id` to player2 (never player1) in the answer response,
+  the match doc, and both players' status views, for friend and ranked.
+- **`completed` is written exactly once**: a `matches_collection` spy
+  sees exactly one `$set {status: "completed"}` per match, carrying
+  `winner_id`, `elo_change` and `updated_at` under the right `_id`
+  filter (ranked persists the real ELO delta, friend persists 0); the
+  rejected post-completion answers/questions and repeated status polls
+  never re-issue it.
+- **Post-completion lockout**: after the deciding answer, further
+  `POST /api/game/answer` (correct OR wrong — the gate fires before
+  grading) and `GET /api/game/question` return
+  `400 "Match is already completed"` for BOTH players on both match
+  types, and none of that traffic disturbs the stored result.
+- **ELO exactly once on ranked, never on friend** (users_collection
+  spy): completion issues exactly two `$inc` updates (winner
+  `+elo/wins`, loser `-elo/losses`), zero before the deciding round,
+  zero more on post-completion retries; friend matches complete with
+  zero users_collection calls even across repeated polls.
+- **Win via the last answer at 2-2**: alternating rounds to 2-2 then a
+  deciding fifth round completes at 3-2 for either seat (ranked pays
+  20, friend pays nothing).
+- **elo_change magnitude mirrors the stored snapshots**:
+  `calculate_elo_change` on the match's `player1_elo`/`player2_elo`
+  snapshots — 20 for the even 1000v1000 guest case, 36 for an underdog
+  win over a 1400 snapshot, 3 for the favorite — and the loser's `$inc`
+  is the exact negation. Both players see the same winner-perspective
+  magnitude via status; friend matches report 0 everywhere.
+- **`/api/game/active` flips off**: both players see
+  `has_active_match: true` (with the right match id) mid-match and a
+  bare `{"has_active_match": false}` immediately after completion, for
+  friend and ranked.
+- **Rematches start clean**: after a completed ranked match, a fresh
+  queue+join forms a NEW match id with 0-0 scores, `winner_id: None`,
+  `elo_change: 0`, no reconnect into the finished match, and the old
+  result stays frozen while the rematch scores independently; same for
+  a fresh friend create/join cycle (opposite winner, both results
+  stand, still zero users_collection writes).
+
+### New bug found
+
+- **Match-point DB-reload race double-completes the match and pays ELO
+  twice** (strict xfail `BUG(match-point-db-race-double-elo)`,
+  `test_race_at_match_point_via_db_reload_should_pay_elo_once`, with a
+  passing current-behavior pin). This deepens known P0 bug 2 (the
+  lock-free double-score race) at its most damaging moment: with both
+  players at 2 points and the round doc re-read from the DB (memory
+  miss + any latency), both submitters pass the `completed` and
+  `winner_id` checks on their own copies, both score, and both execute
+  the completion block. Result: an impossible 3-3 scoreline, FOUR
+  users_collection `$inc` updates instead of two (winner +40 net and
+  +2 wins, loser -40 net and +2 losses on 1000v1000 snapshots), the
+  `completed` status written twice — and both completions credit
+  player1, because `player1_score >= 3` is checked first, so player2's
+  own match point evaporates even in the response handed to player2.
+  *Fix:* take the per-match `asyncio.Lock` (already used by
+  `get_question`) around the read-check-write span of `submit_answer`.
+
+### Current behavior worth knowing (asserted in passing tests)
+
+- **The same race is safe when the round doc is in memory**: there is
+  no suspending await between the completed-status check and the
+  round/score writes, so the first match-point submitter runs to
+  completion and the second bounces off the completed gate with a 400
+  — exactly one completion, exactly two `$inc` updates.
+- **The post-completion 400 gate is the only thing standing between a
+  completed match and re-scoring** — it fires before grading, so even
+  malformed answers cost nothing after completion.
+
+### How to run
+
+```bash
+# Win-completion suite only (33 tests: 32 pass, 1 xfail)
+python3 -m pytest tests/test_match_win_completion_edge_cases.py -q
+
+# Full repository suite (1094 tests: 1037 pass, 57 xfail)
+python3 -m pytest tests/ -q
+```
+
+The xfail is `strict` with a passing current-behavior sibling pin,
+matching the campaign convention.
