@@ -10,15 +10,16 @@ code, challenges to a named user), the challenge accept/cancel endpoints,
 presence tracking and give-up resolution, question serving and round
 progression, answer grading and first-to-3 win conditions, ELO calculation
 and payout, datetime/timezone handling, in-memory-vs-Mongo state
-divergence, and cross-match isolation / access control. Concurrency races,
-DB-unavailable fallbacks, cache eviction/restart scenarios, and malformed
-input were exercised throughout.
+divergence, and cross-match isolation / access control, plus dedicated
+suites for the bot fallback / bot round timing path and the cancel-flag /
+queue lifecycle. Concurrency races, DB-unavailable fallbacks, cache
+eviction/restart scenarios, and malformed input were exercised throughout.
 
 ### Test inventory
 
-Nine dedicated edge-case suites, **455 tests collected** (verified with
-`pytest --collect-only -q`), currently running as **439 passed,
-16 xfailed** — every xfail is strict and pins a real bug documented below.
+Eleven dedicated edge-case suites, **508 tests collected** (verified with
+`pytest --collect-only -q`), currently running as **487 passed,
+21 xfailed** — every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail |
 |---|---|---|
@@ -31,10 +32,12 @@ Nine dedicated edge-case suites, **455 tests collected** (verified with
 | `tests/test_match_question_and_round_edge_cases.py` | 68 | 2 |
 | `tests/test_match_datetime_and_memory_edge_cases.py` | 46 | 3 |
 | `tests/test_match_isolation_and_access_edge_cases.py` | 38 | 2 |
-| **Total** | **455** | **16** |
+| `tests/test_bot_fallback_and_timeout_edge_cases.py` | 28 | 1 |
+| `tests/test_match_cancel_and_queue_lifecycle_edge_cases.py` | 25 | 4 |
+| **Total** | **508** | **21** |
 
 The full repository suite (including pre-existing tests) collects
-491 tests.
+544 tests and runs as 523 passed, 21 xfailed.
 
 ### Severity-ranked bug list
 
@@ -71,7 +74,13 @@ passing tests that assert the broken behavior.
 6. **Stale cancel flag poisons the next pairing** (xfail, ranked suite).
    Re-queueing after `/api/game/cancel` never clears `cancelled_users`;
    the next opponent to pair with that user gets a spurious
-   `"cancelled"` and the user is silently dropped from the queue.
+   `"cancelled"` and the user is silently dropped from the queue. The bot
+   and cancel suites pin three more victims of the same flag lifecycle
+   (each its own xfail): the flag also **eats the 10-second bot fallback**
+   (bot suite), it is planted by a **stray cancel from a user who was
+   never queued** and aborts their first-ever pairing (cancel suite), and
+   it **survives an entire completed match** to abort the user's next
+   pairing in a fresh session (cancel suite).
 7. **Queueing for ranked abandons or hijacks an active friend match**
    (xfail, isolation suite). The stale-match scan ignores `match_type`,
    so "play ranked" reconnects into (or abandons) a live friend match.
@@ -97,58 +106,86 @@ passing tests that assert the broken behavior.
 13. **Friend match-code uniqueness ignores in-memory matches** (xfail,
     friend suite). With the DB empty or down, two live matches can share
     a code and the second becomes unreachable.
+14. **Racing `cancel_challenge` vs `join` lets both succeed** (xfail,
+    cancel suite). Neither endpoint takes the per-match lock; with any DB
+    read latency the join returns 200 and the cancel then deletes the
+    now-active match from DB and memory, leaving the acknowledged joiner
+    holding a match id that 404s on every subsequent request.
+15. **Queue entries never expire without polling** (cancel suite). The
+    10s bot deadline is only evaluated when the queued user polls, so an
+    hour-gone user is still matchable into a **ghost match**; because the
+    ghost never polled, presence reports them connected forever and the
+    live player can't even get a give-up auto-tie.
 
 **P2 — robustness, consistency and policy gaps**
 
-14. **User ELO can go negative** (xfail, ELO suite) — the loser `$inc`
+16. **User ELO can go negative** (xfail, ELO suite) — the loser `$inc`
     has no floor.
-15. **`calculate_elo_change` crashes (`OverflowError`) on extreme rating
+17. **`calculate_elo_change` crashes (`OverflowError`) on extreme rating
     gaps** (xfail, ELO suite) — no input guard; corrupted ratings turn
     answer submission into a 500.
-16. **Match-code case-sensitivity is inconsistent** (xfail, friend
+18. **Match-code case-sensitivity is inconsistent** (xfail, friend
     suite). `/api/game/match/{code}` compares case-sensitively while the
     friend endpoints upper-case; the two code namespaces disagree.
-17. **Self-challenge is allowed** (xfail, challenge suite) — a user can
+19. **Self-challenge is allowed** (xfail, challenge suite) — a user can
     create and accept a challenge against themselves.
-18. **Challenge endpoints have no in-memory fallback** (challenge suite).
-    With the DB down, a memory-held pending challenge is invisible to
-    `pending`/`accept`/`cancel` yet still playable (see bug 9).
-19. **Broad unauthenticated exposure**: `/matches/all` returns the last
+20. **Challenge endpoints have no in-memory fallback** (challenge suite;
+    now also xfail in the cancel suite for `cancel_challenge`). With the
+    DB down, a memory-held pending challenge is invisible to
+    `pending`/`accept`/`cancel` yet still playable (see bug 9), and a
+    memory-only waiting friend match is joinable by code but its creator
+    cannot cancel it (404).
+21. **Broad unauthenticated exposure**: `/matches/all` returns the last
     50 matches of all players to any caller, and
     `/api/game/friend/status/{code}` polls any match anonymously.
+22. **Unbounded in-memory leaks around cancel** (cancel suite).
+    `cancelled_users` grows forever (no TTL/cap; entries are only removed
+    by a later pairing involving that user), and cancelling a waiting
+    match whose creator already fetched a question orphans the round in
+    `in_memory_rounds` and the lock in `match_locks` permanently.
+23. **`is_opponent_bot` uses a substring check** (bot suite).
+    `/match/{code}` labels any opponent whose id contains `"bot"` (e.g.
+    `guest-abbot-1234`) as a bot, while gameplay correctly treats them as
+    human; the real sentinel is `player2_id == "bot-opponent"`.
 
 ### Recommended fix order
 
 1. **Lock down `/match/{id}/details`** (bug 1): require auth + participant
    check, and strip unresolved-round answers from the payload. Smallest
    change, biggest exploit closed.
-2. **Serialize writes with the existing per-match lock** (bugs 2, 4, 5):
-   `submit_answer` and `join_friend_match` should take `get_match_lock`
-   like `get_question` already does; move the ranked opponent pop before
-   the `find_one` await (or re-check after it).
+2. **Serialize writes with the existing per-match lock** (bugs 2, 4, 5,
+   14): `submit_answer`, `join_friend_match` and `cancel_challenge`
+   should take `get_match_lock` like `get_question` already does; move
+   the ranked opponent pop before the `find_one` await (or re-check
+   after it).
 3. **Fix id generation** (bugs 3, 11): replace `match_counter` with a
    collision-free id (UUID/ObjectId) and derive round numbers from the
    match doc or Mongo, not from `in_memory_rounds`.
-4. **Fix lifecycle/status gating** (bugs 6, 7, 8, 9): clear
-   `cancelled_users` on re-queue, filter the stale-match scan by
+4. **Fix lifecycle/status gating** (bugs 6, 7, 8, 9, 15): clear the
+   user's `cancelled_users` flag whenever they (re-)queue or a match is
+   created for them, only accept cancels from actually-queued users,
+   expire stale queue entries, filter the stale-match scan by
    `match_type`, and have gameplay routes reject `abandoned` and
    `pending` matches, not just `completed`.
 5. **Fix round-array numbering** (bug 10): number the `$push`ed summary
    with the same `round_count + 1` used for the round doc.
 6. **Harden datetime handling** (bug 12): run `created_at` through
    `ensure_utc`/`parse_round_start` in the reconnect window.
-7. **Sweep the P2s** (bugs 13–19): in-memory code-collision check, ELO
-   floor and overflow guard, code-case normalization, self-challenge
-   rejection, challenge memory fallback, and an access review of
-   `/matches/all` and the anonymous status poller.
+7. **Sweep the rest** (bugs 13, 16–23): in-memory code-collision check,
+   ELO floor and overflow guard, code-case normalization, self-challenge
+   rejection, challenge memory fallback (including `cancel_challenge`),
+   an access review of `/matches/all` and the anonymous status poller,
+   TTL/cleanup for `cancelled_users` and cancel-orphaned rounds/locks,
+   and replacing the `is_opponent_bot` substring check with the
+   `"bot-opponent"` sentinel.
 
 ### How to run the tests
 
 ```bash
-# Full suite (491 tests)
+# Full suite (544 tests: 523 pass, 21 xfail)
 python3 -m pytest tests/ -q
 
-# Edge-case campaign only (455 tests: 439 pass, 16 xfail)
+# Edge-case campaign only (508 tests: 487 pass, 21 xfail)
 python3 -m pytest tests/test_ranked_matchmaking_edge_cases.py \
   tests/test_friend_match_edge_cases.py \
   tests/test_challenge_match_edge_cases.py \
@@ -157,7 +194,9 @@ python3 -m pytest tests/test_ranked_matchmaking_edge_cases.py \
   tests/test_match_answer_and_scoring_edge_cases.py \
   tests/test_match_question_and_round_edge_cases.py \
   tests/test_match_datetime_and_memory_edge_cases.py \
-  tests/test_match_isolation_and_access_edge_cases.py -q
+  tests/test_match_isolation_and_access_edge_cases.py \
+  tests/test_bot_fallback_and_timeout_edge_cases.py \
+  tests/test_match_cancel_and_queue_lifecycle_edge_cases.py -q
 
 # Verify the inventory
 python3 -m pytest --collect-only -q tests/
