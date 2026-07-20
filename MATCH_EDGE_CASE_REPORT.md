@@ -21,9 +21,9 @@ scenarios, and malformed input were exercised throughout.
 
 ### Test inventory
 
-Thirteen dedicated edge-case suites, **704 tests collected** (verified with
-`pytest --collect-only -q`), currently running as **680 passed,
-24 xfailed** — every xfail is strict and pins a real bug documented below.
+Fifteen dedicated edge-case suites, **795 tests collected** (verified with
+`pytest --collect-only -q`), currently running as **767 passed,
+28 xfailed** — every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail |
 |---|---|---|
@@ -40,10 +40,12 @@ Thirteen dedicated edge-case suites, **704 tests collected** (verified with
 | `tests/test_match_cancel_and_queue_lifecycle_edge_cases.py` | 25 | 4 |
 | `tests/test_match_api_contract_edge_cases.py` | 80 | 1 |
 | `tests/test_match_math_equivalence_in_pvp_edge_cases.py` | 116 | 2 |
-| **Total** | **704** | **24** |
+| `tests/test_match_multiplayer_stress_edge_cases.py` | 54 | 4 |
+| `tests/test_match_auth_identity_edge_cases.py` | 37 | 0 |
+| **Total** | **795** | **28** |
 
 The full repository suite (including pre-existing tests) collects
-740 tests and runs as 716 passed, 24 xfailed.
+831 tests and runs as 803 passed, 28 xfailed.
 
 ### Severity-ranked bug list
 
@@ -222,10 +224,10 @@ passing tests that assert the broken behavior.
 ### How to run the tests
 
 ```bash
-# Full suite (740 tests: 716 pass, 24 xfail)
+# Full suite (831 tests: 803 pass, 28 xfail)
 python3 -m pytest tests/ -q
 
-# Edge-case campaign only (704 tests: 680 pass, 24 xfail)
+# Edge-case campaign only (795 tests: 767 pass, 28 xfail)
 python3 -m pytest tests/test_ranked_matchmaking_edge_cases.py \
   tests/test_friend_match_edge_cases.py \
   tests/test_challenge_match_edge_cases.py \
@@ -238,7 +240,9 @@ python3 -m pytest tests/test_ranked_matchmaking_edge_cases.py \
   tests/test_bot_fallback_and_timeout_edge_cases.py \
   tests/test_match_cancel_and_queue_lifecycle_edge_cases.py \
   tests/test_match_api_contract_edge_cases.py \
-  tests/test_match_math_equivalence_in_pvp_edge_cases.py -q
+  tests/test_match_math_equivalence_in_pvp_edge_cases.py \
+  tests/test_match_multiplayer_stress_edge_cases.py \
+  tests/test_match_auth_identity_edge_cases.py -q
 
 # Verify the inventory
 python3 -m pytest --collect-only -q tests/
@@ -1299,3 +1303,118 @@ False` and an integer answer) drives the numeric-tolerance branch.
   infinities `oo`/`zoo`/`nan`. The broad `except (SympifyError, Exception)`
   swallows every failure — which is exactly why the one input that *hangs*
   rather than *raises* (`9**9**9`, bug 24) is so dangerous.
+
+## Auth identity & match ownership (`get_current_user`, `tests/test_match_auth_identity_edge_cases.py`)
+
+37 tests (all passing — this suite documents *current behavior* rather than
+adding new xfails; the defects it exercises are already pinned by the 401
+xfail in the API-contract suite and the exposure findings in the isolation
+suite). Everything turns on the demo-mode resolver `get_current_user`
+(main.py ~242-310), whose exact contract is: (1) a `Bearer` token starting
+with `"guest-"` becomes that guest verbatim, unverified; (2) no credentials
+at all become the single shared fallback `"guest-user-id"`; (3) otherwise a
+JWT is decoded, and **every** failure — missing `sub`, unknown email, bad
+signature, expired, wrong scheme, empty token — silently falls back to that
+same `"guest-user-id"`. Only a valid JWT whose `sub` email resolves in
+`users_collection` yields a real (ObjectId) identity.
+
+The suite is organized around ten identity quirks that break people-matching:
+
+1. **Anonymous callers all share one identity.** With no `Authorization`
+   header every caller is `"guest-user-id"`, so two anonymous browsers
+   occupy the *same* matchmaking-queue slot and can never pair (a self-match
+   is impossible); no match is ever created for the shared id. Pinned by
+   `test_two_anonymous_callers_share_one_queue_slot_and_never_match` and
+   `test_anonymous_pair_cannot_form_a_ranked_match`.
+2. **Two distinct explicit guest tokens are two identities** that pair into
+   a normal ranked match — `test_two_distinct_guests_pair_into_a_ranked_match`.
+3. **`Bearer guest-user-id` collides with the no-auth fallback.** The
+   string `"guest-user-id"` itself starts with `"guest-"`, so the explicit
+   token and the tokenless path resolve to one identity and cannot match
+   each other, though either can still match a *different* guest. Pinned by
+   `test_anonymous_then_explicit_guest_user_id_is_one_queue_slot` and
+   `test_explicit_guest_user_id_can_match_a_different_guest`.
+4. **Every invalid-JWT form collapses to the shared guest.** A garbage
+   bearer, two *different* garbage bearers, a `Basic` scheme, an empty
+   `Bearer `, a wrong-secret forgery and an expired token all resolve to
+   `"guest-user-id"` — so two different malformed tokens still can't match
+   each other, but each can match a real guest. Pinned by
+   `test_two_different_bad_tokens_collapse_to_one_identity_and_cannot_match`
+   and `test_wrong_scheme_and_empty_bearer_also_fall_back_to_guest`.
+5. **Username challenges require a registered user in the DB.** `friend/create`
+   with `opponent_username` does an exact `users_collection.find_one`; a
+   registered username yields a `pending` challenge pinned to that user's
+   ObjectId, while an unknown name (or a guest's on-screen `Guest xxxx`
+   label, which is *not* a username document) silently degrades to a
+   `waiting` open match. Pinned by
+   `test_challenge_to_registered_username_creates_pending`,
+   `test_challenge_to_unknown_username_degrades_to_waiting` and
+   `test_guest_display_names_are_not_registered_usernames`.
+6. **ObjectId-vs-string comparison differs by route.** An ObjectId equals
+   its own hex string *only after `str()`*
+   (`test_objectid_equals_its_hex_string_only_after_str`). Gameplay routes
+   (`question/answer/give-up/status`) `str()`-compare both sides, so an
+   ObjectId owner is admitted via their JWT; the ownership checks in
+   `join_friend_match` ("cannot join your own match") and `accept_challenge`
+   compare **raw**, where ObjectId==ObjectId still holds but no guest string
+   can ever collide with an ObjectId — so a registered invitee can accept an
+   ObjectId challenge while a guest cannot. Pinned by
+   `test_registered_user_cannot_join_their_own_waiting_match`,
+   `test_registered_invitee_can_accept_objectid_challenge`,
+   `test_guest_cannot_accept_an_objectid_invitee_challenge` and
+   `test_gameplay_str_compare_admits_the_objectid_owner`.
+   *Latent risk:* because `get_current_user` never mints a bare-hex-string
+   identity (guest ids always start with `"guest-"`), the raw-vs-`str()`
+   divergence cannot currently be *exploited* to confuse ownership — but any
+   future code path that produces a hex-string `_id` would immediately make
+   the two comparison styles disagree.
+7. **Mixed ObjectId/guest matches compare correctly via `str()`.** A match
+   with an ObjectId player1 and a guest-string player2 admits both real
+   participants on `status` (ids stringified in the payload) and 403s an
+   outsider guest; an anonymous caller is an outsider unless the shared
+   `"guest-user-id"` is literally a participant. Pinned by
+   `test_status_admits_the_objectid_player_via_jwt`,
+   `test_outsider_guest_is_403_on_a_mixed_id_match` and
+   `test_anonymous_caller_is_outsider_unless_the_guest_is_shared_id`.
+8. **Changing the token mid-match locks you out of your own match.**
+   Ownership is bound to the exact token, so after a storage wipe / re-login
+   that mints a new guest id, `question/answer/give-up/status` all 403 the
+   new token while the original identity retains full ownership and can
+   still score. Dropping the token entirely (→ `guest-user-id`) is likewise
+   an outsider. Pinned by
+   `test_changing_token_mid_match_locks_the_player_out`,
+   `test_original_token_still_owns_the_match_after_the_switch` and
+   `test_switching_to_no_auth_mid_match_is_also_an_outsider`.
+9. **One person with two tokens can match against themselves.** Two tabs
+   mint two distinct guest ids that the backend treats as two players, so
+   they pair and can play a self-match to completion — a matchmaking
+   integrity gap (self-play farming). Pinned by
+   `test_same_person_two_tokens_match_against_themselves` and
+   `test_same_person_can_play_a_full_self_match_to_completion`.
+10. **`get_current_user` resolution decides ownership, not the token's
+    email.** A valid JWT resolves to the DB user (ObjectId identity); a
+    token with no `sub`, an email absent from the DB, an expired signature,
+    or a wrong-secret forgery all fall back to `"guest-user-id"`. A
+    registered user's own *expired* token is therefore an outsider on the
+    match they created, and anything created anonymously is owned by the
+    shared guest — so a *second* anonymous caller inherits it (there is no
+    per-session isolation for tokenless users). Pinned by
+    `test_valid_jwt_resolves_to_the_db_user_identity`,
+    `test_jwt_without_sub_falls_back_to_shared_guest`,
+    `test_expired_jwt_falls_back_to_shared_guest`,
+    `test_registered_owner_and_expired_token_do_not_share_a_match` and
+    `test_no_credentials_shares_ownership_across_all_anonymous_callers`.
+
+### Cross-references to already-pinned bugs
+
+- The complete absence of a 401 path (all missing/malformed/wrong-scheme
+  credentials return a 200 guest identity) is bug 26, pinned by the
+  API-contract suite's `test_anonymous_state_change_should_be_401` (xfail).
+- The shared-guest-identity collision for anonymous callers is the same root
+  cause behind the unauthenticated-exposure findings (bugs 1/21) — anyone
+  tokenless is admitted as `"guest-user-id"`.
+
+No new bug is filed here: the self-match gap (case 9) and the
+change-token-lockout (case 8) are inherent to demo-mode auth and are
+documented as current behavior rather than defects to fix in isolation;
+they resolve once real authentication (bug 26 / the fix-order §9 item) lands.
