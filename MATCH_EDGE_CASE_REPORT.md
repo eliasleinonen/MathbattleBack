@@ -2002,3 +2002,112 @@ python3 -m pytest tests/ -q
 
 The xfail is `strict` with two current-behavior sibling pins (DB-write
 spy and post-eviction resurrection), matching the campaign convention.
+
+## Match listing & history (`/matches/all`, `/match/{id}/details`, `tests/test_match_history_and_listing_edge_cases.py`)
+
+33 tests (27 pass, 6 strict `xfail`). A dedicated pass over the read-side
+"history" surface of people matches: the `/matches/all` listing, the
+`/match/{id}/details` per-match history, and the corner of
+`/api/leaderboard` that returns empty cleanly. Unlike the sibling suites,
+`matches_collection` is backed by a small **Mongo-semantics emulator**
+(real `sort`/`limit` on `find`, `$set`/`$push` and the positional
+`rounds.$` operator on `update_one`, deepcopies at the driver boundary),
+because both endpoints read **only from the DB** — they show exactly what
+real Mongo would hold after the routes' `$push`/positional updates ran,
+which is what surfaces the persistence bugs below. With this file the
+full repository suite collects **968 tests** and runs as **924 passed,
+44 xfailed**.
+
+### New bug
+
+36. **P1 — Post-tie round results and scores are never persisted; the
+    listing/details history of any match containing a tie is frozen at
+    the tie** (three xfails, all one root cause = bug 10's downstream
+    blast radius, newly measured at the history surface):
+    - `test_details_round_numbers_should_stay_strictly_increasing_after_tie`
+      — after one tie the details rounds array reads `[1, 1]` (pinned by
+      `test_current_behavior_tie_duplicates_round_number_in_rounds_array`).
+    - `test_post_tie_round_results_should_be_persisted_to_history` — the
+      round played after a tie is decided in memory, but the positional
+      update filters on the round doc's count-based number (2), which no
+      array element carries, so Mongo drops the winner, the winning
+      answer **and the score `$set` bundled into the same update**
+      (pinned by
+      `test_current_behavior_post_tie_round_win_never_recorded_in_history`:
+      details show the decided round as open, `player1_answer: null`,
+      and the listing still says `0-0` while memory says `1-0`).
+    - `test_completed_match_listing_score_should_match_final_result` —
+      completion itself persists (plain `_id` filter), so after
+      tie-then-3-wins the DB doc, the listing and details all report a
+      **completed match with a winner and a `0-0` score** (pinned by
+      `test_current_behavior_completed_match_after_tie_lists_stale_score`;
+      `rounds_count` still counts 4 correctly because `$push` never
+      misses).
+
+    *Fix:* same one-liner as bug 10 — number the `$push`ed summary with
+    the round doc's `round_count + 1`; every positional update then hits
+    its element again and the score/winner/answer writes stop vanishing.
+
+### Promotions / rediscoveries of known bugs (new xfails)
+
+- **`/matches/all` requires no credentials and has no ownership filter**
+  (`test_matches_all_should_require_credentials`, xfail
+  `BUG(matches-all-open-history)`). Previously pinned as a passing quirk
+  in the isolation suite (bug 21) — promoted to a strict xfail here per
+  the security-pin convention, with fresh pins showing a headerless
+  caller and any guest reading strangers' live scores.
+- **The details history is a live answer oracle even for participants**
+  (`test_details_should_not_reveal_unresolved_round_answer`, xfail
+  `BUG(details-answer-oracle)`, same root cause as bug 1): mid-round the
+  rounds array already carries `answer` and `derivative` of the open
+  round, so either player can cheat from a second tab.
+- **Abandonment never reaches the DB** (bug 35, rediscovered at the
+  history surface): after an HTTP-triggered abandonment,
+  `/api/game/status` says `abandoned` while `/matches/all` **and**
+  `/match/{id}/details` (both DB-first) say `active`
+  (`test_abandoned_match_should_be_listed_as_abandoned`, xfail, plus
+  current-behavior pin). A directly-persisted `abandoned` doc IS listed
+  verbatim, so the listing itself doesn't filter terminal states.
+
+### Passing findings worth knowing (current behavior, pinned by tests)
+
+- **Empty history is a clean `[]`** (authed and headerless), and so is
+  an empty leaderboard. But the listing is **DB-only with no memory
+  fallback** — with the DB down, a live playable match is in nobody's
+  history (`test_matches_all_is_db_only_so_memory_matches_are_invisible`)
+  — the exact inverse of details, which falls back to memory.
+- **Details' memory fallback blanks round history**: round summaries are
+  `$push`ed to Mongo only, so when the DB doc is gone the fallback
+  serves the live score with `rounds: []` for a match that demonstrably
+  played rounds
+  (`test_current_behavior_details_memory_fallback_blanks_round_history`).
+- **Limit/sort**: hard cap of 50, newest-first by `created_at`, the
+  oldest entries silently fall off with no paging; datetime
+  `created_at` is isoformat()ed while legacy string values pass through
+  verbatim.
+- **Sequential-play history is accurate (absent ties)**: 5 friend
+  matches + 1 ranked + 1 live match list with correct per-match scores
+  (`3-0`/`0-3`), statuses and `rounds_count`, newest first.
+- **Completed details are complete**: ranked — `winner`, `score: "3-0"`,
+  `elo_change == calculate_elo_change(1000, 1000) == 20`, per-round
+  winners and answers; friend — winner set with `elo_change: 0`.
+- **Friend vs ranked in listings**: `/matches/all` entries expose no
+  `match_type` — friend, ranked and even bot matches are shape-identical
+  (the only bot tell is the `"AI Opponent"` player2 label); details is
+  the only place to distinguish (`friend`/`ranked`/`random`, and
+  `"unknown"` for legacy docs missing the field). A waiting friend match
+  is listed with a `"Player 2"` placeholder and details stringify the
+  missing opponent as the known `id: "None"` quirk.
+
+### How to run
+
+```bash
+# Listing & history suite only (33 tests: 27 pass, 6 xfail)
+python3 -m pytest tests/test_match_history_and_listing_edge_cases.py -q
+
+# Full repository suite (968 tests: 924 pass, 44 xfail)
+python3 -m pytest tests/ -q
+```
+
+All six xfails are `strict` with current-behavior sibling pins, matching
+the campaign convention.
