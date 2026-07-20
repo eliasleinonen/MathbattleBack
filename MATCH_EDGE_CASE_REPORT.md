@@ -28,9 +28,9 @@ throughout.
 
 ### Test inventory
 
-20 dedicated edge-case suites, **990 edge-case tests collected**
+21 dedicated edge-case suites, **1025 edge-case tests collected**
 (verified with `pytest --collect-only -q`). Full repository suite:
-**1026 collected → 972 passed, 54 xfailed**.
+**1061 collected → 1005 passed, 56 xfailed**.
 Every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail markers |
@@ -50,15 +50,16 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_math_equivalence_in_pvp_edge_cases.py` | 117 | 3 |
 | `tests/test_match_multiplayer_stress_edge_cases.py` | 54 | 4 |
 | `tests/test_match_newly_found_bugs_edge_cases.py` | 12 | 6 |
+| `tests/test_match_objectid_guest_mixing_edge_cases.py` | 35 | 2 |
 | `tests/test_match_presence_and_lifecycle_edge_cases.py` | 68 | 1 |
 | `tests/test_match_question_and_round_edge_cases.py` | 68 | 2 |
 | `tests/test_match_reconnect_abandon_edge_cases.py` | 35 | 1 |
 | `tests/test_match_status_gate_edge_cases.py` | 58 | 10 |
 | `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
-| **Edge-case total** | **990** | **54** |
+| **Edge-case total** | **1025** | **56** |
 
 The full repository suite (including pre-existing tests) collects
-1026 tests and runs as 972 passed, 54 xfailed.
+1061 tests and runs as 1005 passed, 56 xfailed.
 
 ### Severity-ranked bug list
 
@@ -2116,6 +2117,120 @@ python3 -m pytest tests/ -q
 ```
 
 All six xfails are `strict` with current-behavior sibling pins, matching
+the campaign convention.
+
+## ObjectId ↔ guest-string id mixing (`tests/test_match_objectid_guest_mixing_edge_cases.py`)
+
+35 tests (33 pass, 2 strict `xfail`). A dedicated pass over every seam
+where a registered user's `ObjectId` `_id` meets a guest's plain string
+id inside one people match: queue keys (`str(_id)` hex), `start_match`'s
+`ObjectId(user_id) if ObjectId.is_valid(user_id) else user_id`
+round-trip, the friend/challenge docs that store `current_user["_id"]`
+raw, the `str()`-bridging gameplay ownership gates, the raw-comparing
+challenge accept/cancel gates, and the ELO `$inc` targets on ranked
+completion. Backed by a fake `users_collection` (resolves `_id` /
+`email` / `username` queries, applies `$set`/`$inc` with **no upsert**,
+and records every update filter so tests can assert *which id type* the
+ELO writes carry) plus the flat-equality `matches_collection` fake for
+the DB-only challenge routes. With this file the full repository suite
+collects **1061 tests** and runs as **1005 passed, 56 xfailed**.
+
+### New bug
+
+37. **P3 — Challenge accept/cancel/pending have zero id-type bridging,
+    so a challenge doc whose ids degraded to hex strings is permanently
+    orphaned** (xfail `BUG(challenge-id-type-lockout)`,
+    `test_hex_string_challenge_should_be_acceptable_by_its_objectid_invitee`,
+    plus current-behavior pins). If `player2_id` is stored as the
+    invitee's 24-hex *string* (JSON round-trip, backup restore, external
+    writer) rather than the `ObjectId`, then for the genuine invitee's
+    JWT: the pending list (`{"player2_id": ObjectId}` query) misses the
+    doc entirely, accept raw-compares `ObjectId != "hex"` and returns
+    403 "Not your challenge to accept" — yet the `str()`-bridging
+    gameplay routes admit the very same credential to the very same
+    match as player 2
+    (`test_current_behavior_hex_string_challenge_locked_but_playable`).
+    The mirror on the cancel side leaves the doc uncancellable by its
+    own creator
+    (`test_current_behavior_hex_string_creator_id_locks_out_cancel`).
+    *Fix:* compare `str(match["player2_id"]) == str(current_user["_id"])`
+    (and likewise for player1 in cancel), the same normalization every
+    gameplay route already uses.
+
+### Rediscoveries / deepenings of known bugs
+
+- **Bug 5 deepened — the ObjectId pairing race also lies to both racers
+  and mints a ghost match** (xfail `BUG(pairing-race)` deepened,
+  `test_concurrent_objectid_joiners_should_not_both_report_matched`).
+  The original xfail pins the double-pairing itself; the new one pins
+  that BOTH concurrent joiners receive `status: "matched"` against the
+  same single queued player. The current-behavior sibling
+  (`test_current_behavior_double_pairing_leaves_a_ghost_match`) shows
+  the fallout: the queued player sits in two active matches while
+  `/api/game/active` only ever surfaces the first, so the second
+  racer's match is an undiscoverable-but-playable ghost.
+- **BUG(active-mislabels-humans-as-bot) rediscovered on ranked
+  matches**: in a queue-paired human-vs-human match, the registered
+  player's `/api/game/active` labels their guest opponent
+  `"AI Opponent"` (raw-`_id` users lookup misses every guest), while
+  the guest's own poll resolves the registered opponent's real username
+  through the stored ObjectId
+  (`test_active_match_resolves_objectid_opponent_but_mislabels_guest`).
+
+### Current behavior worth knowing (asserted in passing tests)
+
+- **The queue is all-strings; match docs are re-typed**: a registered
+  user queues under their hex string, and pairing converts it *back*
+  into a genuine `ObjectId` in the match doc, value-equal to the
+  original. Guest ids stay strings; the two types sit side by side in
+  one document (`player1_id: "guest-..."`, `player2_id: ObjectId`).
+- **ELO snapshot asymmetry at pairing**: ObjectId opponents get a fresh
+  live `users_collection` read (a rating change while queued is picked
+  up), guests get the hard-coded 1000; the queue-time snapshot is
+  ignored for both. The joiner is told `"Player"` when the opponent is
+  a guest.
+- **`cancelled_users` bridges types correctly**: cancel stores
+  `str(_id)` and pairing checks `str(_id)`, so a registered user's
+  cancel flag is honored across the type boundary.
+- **Gameplay `str()` comparisons route everything correctly in mixed
+  friend matches**: round wins credit the right side (winner stored as
+  raw `ObjectId`, stringified to hex in every payload), give-up flags
+  map the ObjectId caller to `player1_gave_up`, and a guest can win the
+  match with `elo_change: 0` and zero `users_collection` writes.
+- **Ranked ELO writes target the correct doc — when one exists**: the
+  winner `$inc` filter carries a genuine `ObjectId` (never the hex
+  string) and lands on the right user; the guest side's `$inc` targets
+  the raw guest string, matches no doc, and (no upsert) silently
+  evaporates — so a mixed ranked match applies rating changes to only
+  one side, and a guest winner drains real ELO from an ObjectId loser
+  while gaining nothing durable.
+- **Challenge-by-username pins the invitee's ObjectId** next to a guest
+  challenger's string; the real invitee accepts via raw
+  `ObjectId == ObjectId`, the guest creator cancels via raw
+  `str == str`, and the invitee cannot cancel (403).
+- **A `"guest-<24hex>"` lookalike token stays a plain string
+  everywhere**: `ObjectId.is_valid` rejects it (30 chars), so no
+  coercion happens at pairing; the embedded hex being a strict suffix
+  of the real user's id never cross-credits scores, never passes an
+  ownership gate on the real user's matches, cannot accept their
+  challenges, and is labeled `"Guest"` (not the registered username,
+  not a bot) by the by-code endpoint.
+- **Payload stringification is consistent across surfaces**: status,
+  details and by-code all emit `str(ObjectId)` hex next to verbatim
+  guest strings, resolve usernames only for the ObjectId side, and fall
+  back to `"Player 1"`/`"Player 2"`/`"Guest"` for guests.
+
+### How to run
+
+```bash
+# Id-mixing suite only (35 tests: 33 pass, 2 xfail)
+python3 -m pytest tests/test_match_objectid_guest_mixing_edge_cases.py -q
+
+# Full repository suite (1061 tests: 1005 pass, 56 xfail)
+python3 -m pytest tests/ -q
+```
+
+Both xfails are `strict` with current-behavior sibling pins, matching
 the campaign convention.
 
 ## Status gating matrix (`tests/test_match_status_gate_edge_cases.py`)
