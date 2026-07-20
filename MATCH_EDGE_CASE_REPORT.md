@@ -2717,3 +2717,92 @@ python3 -m pytest tests/ -q
 
 All four xfails are `strict` and sit next to passing current-behavior
 pins, matching the campaign convention.
+
+## Audit pass 3: deeper coverage of the grading/expiry bugs (38-41)
+
+A third pass took the four bugs pinned in audit pass 2 and widened each
+one along the axis pass 2 left open, rather than re-pinning the same
+cases. The work lives in `tests/test_match_grading_expiry_deep_edge_cases.py`:
+**41 tests (23 pass, 18 strict `xfail`)**. No genuinely new bug number was
+needed — every finding deepens 38-41 — but one previously-unpinned
+*consequence* of bug 41 is called out below (a real ELO transfer to an
+absent player). With this file the full repository suite collects **1201
+tests** and runs as **1120 passed, 81 xfailed**.
+
+### What each area added (report numbers 38-41)
+
+38. **PvP answer path ignores the 300s round expiry — broadened.** Pass 2
+    pinned 301s and 7200s; pass 3 parametrizes the "still accepted"
+    behavior across **301s / 600s / 3600s**
+    (`test_pvp_answer_after_expiry_should_void` strict xfail +
+    `test_current_behavior_pvp_answer_after_expiry_still_wins` pins) and
+    brackets the boundary itself. `get_question` uses a strict `>300s`
+    cutoff, so a round aged 299s is re-served live while a 301s round is
+    voided as a tie — yet an equally-aged round is still fully scorable
+    through `submit_answer`
+    (`test_boundary_answer_and_question_should_agree_just_past_300s` strict
+    xfail; `test_current_behavior_boundary_question_voids_but_answer_scores`
+    pins both sides of the ~300s line).
+
+38 × ELO. The most damaging interaction gets its own strict xfail:
+    at match point a correct answer on an expired (3600s) deciding round
+    completes the ranked match and pays a full ±20 ELO swing
+    (`test_late_answer_at_match_point_should_not_pay_elo` xfail vs
+    `test_current_behavior_late_answer_at_match_point_pays_elo` pin). A
+    round the next `get_question` would have voided should not settle a
+    ranked match.
+
+39. **Numeric fallback's absolute 1e-6 cliff — swept.** Pass 2 pinned
+    three near-misses; pass 3 sweeps the cliff from both sides with
+    deterministic *constant* offsets: `2*x + {1e-7, 5e-7, 9e-7, 9.9e-7}`
+    are all accepted (below tolerance) and `2*x + {1.1e-6, 2e-6, 1e-5,
+    1e-3}` are all rejected (above it), bracketing 1e-6 tightly
+    (`test_sub_tolerance_offsets_should_be_rejected` strict xfail +
+    `test_current_behavior_sub_tolerance_offsets_win` /
+    `test_current_behavior_above_tolerance_offsets_rejected` pins). A
+    separate "symbolic reject then numeric accept" section covers
+    *polynomial* near-misses whose error scales with x but stays under
+    1e-6 across the whole (1, 10) window — `(2+1e-8)*x`, `2*x + 1e-8*x`,
+    `2.0000001*x`, `(2+1e-9)*x` — all refuted by `simplify` yet accepted by
+    the fallback (`test_polynomial_near_misses_should_be_rejected` strict
+    xfail + `test_current_behavior_polynomial_near_misses_win` pin).
+
+40. **Positive-axis lookalikes — beyond abs/sqrt.** Pass 2 pinned
+    `2*abs(x)` and `2*sqrt(x^2)`; pass 3 broadens the family to `Abs(2*x)`,
+    `sqrt(4*x^2)`, `x + Abs(x)` (which is 2x for x>0 and 0 for x<0), and
+    `2*Max(x, -x)`. Every one agrees with 2·x on the sampled positive axis
+    and disagrees for some x<0, so all grade correct
+    (`test_positive_axis_lookalikes_should_be_rejected` strict xfail +
+    `test_current_behavior_positive_axis_lookalikes_win` pins), while the
+    contrast pin shows `-2*x` (wrong on the sampled interval) is still
+    caught (`test_current_behavior_negative_only_disagreement_still_rejected`).
+
+41. **Reconnect leaves the queue entry — full exploit to a real ELO
+    transfer.** Pass 2 pinned the ghost pairing and that the newcomer can
+    solo-play it. Pass 3 follows the exploit to its damaging end: the
+    stranded newcomer C solo-plays the ranked ghost to 3-0, the match
+    *completes and pays a real ±20 ELO swing*, charging the absent player A
+    a ranked **loss on a match A was never even shown** by
+    `/api/game/active`
+    (`test_current_behavior_ghost_completion_pays_real_elo_to_absent_player`
+    asserts the `{"elo": -20, "losses": 1}` write is keyed to A). A
+    distinct strict xfail states the post-fix invariant — with the
+    reconnect branch dequeuing the caller, the next ranked searcher should
+    stay `"searching"` rather than be ghost-paired
+    (`test_next_searcher_should_stay_searching_not_ghost_paired`). The ELO
+    charge to an absent participant is the new, previously-unpinned
+    consequence surfaced this pass; the *fix* is still the one-line
+    `matchmaking_queue.pop(user_id, None)` in the reconnect return path.
+
+### How to run
+
+```bash
+# Audit pass 3 suite only (41 tests: 23 pass, 18 xfail)
+python3 -m pytest tests/test_match_grading_expiry_deep_edge_cases.py -q
+
+# Full repository suite (1201 tests: 1120 pass, 81 xfail)
+python3 -m pytest tests/ -q
+```
+
+All 18 xfails are `strict` and sit next to passing current-behavior pins,
+matching the campaign convention.
