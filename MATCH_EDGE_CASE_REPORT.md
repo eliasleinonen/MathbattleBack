@@ -28,9 +28,9 @@ throughout.
 
 ### Test inventory
 
-19 dedicated edge-case suites, **932 edge-case tests collected**
+20 dedicated edge-case suites, **990 edge-case tests collected**
 (verified with `pytest --collect-only -q`). Full repository suite:
-**968 collected → 924 passed, 44 xfailed**.
+**1026 collected → 972 passed, 54 xfailed**.
 Every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail markers |
@@ -53,11 +53,12 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_presence_and_lifecycle_edge_cases.py` | 68 | 1 |
 | `tests/test_match_question_and_round_edge_cases.py` | 68 | 2 |
 | `tests/test_match_reconnect_abandon_edge_cases.py` | 35 | 1 |
+| `tests/test_match_status_gate_edge_cases.py` | 58 | 10 |
 | `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
-| **Edge-case total** | **932** | **44** |
+| **Edge-case total** | **990** | **54** |
 
 The full repository suite (including pre-existing tests) collects
-968 tests and runs as 924 passed, 44 xfailed.
+1026 tests and runs as 972 passed, 54 xfailed.
 
 ### Severity-ranked bug list
 
@@ -2116,3 +2117,78 @@ python3 -m pytest tests/ -q
 
 All six xfails are `strict` with current-behavior sibling pins, matching
 the campaign convention.
+
+## Status gating matrix (`tests/test_match_status_gate_edge_cases.py`)
+
+58 tests (48 pass, 10 strict `xfail`). A systematic pass over **which
+match statuses allow which operations**: every status in {`waiting`,
+`pending`, `active`, `completed`, `abandoned`} is crossed with every
+mutating/reading match route, each cell asserted by a parametrized test.
+Matches are seeded directly into both stores (in-memory + a FakeMatchesDB
+stand-in, because the challenge endpoints are DB-only), so each cell
+isolates the status check itself. With this file the full repository
+suite collects **1026 tests** and runs as **972 passed, 54 xfailed**.
+
+### The measured gate matrix (current behavior)
+
+| route \ status | waiting | pending | active | completed | abandoned |
+|---|---|---|---|---|---|
+| `GET /api/game/question` | ALLOW ⚠ | ALLOW ⚠ | ALLOW | reject 400 | ALLOW ⚠ |
+| `POST /api/game/answer` | ALLOW ⚠ | ALLOW ⚠ | ALLOW | reject 400 | ALLOW ⚠ |
+| `POST /api/game/give-up` | ALLOW ⚠ | ALLOW ⚠ | ALLOW | ALLOW ⚠ | ALLOW ⚠ |
+| `GET /api/game/status/{id}` | allow | allow | allow | allow | allow |
+| `POST /api/game/friend/join` | ALLOW | reject 400 | reject 400 | reject 400 | reject 400 |
+| `POST /api/challenges/accept` | reject 403 | ALLOW | reject 400 | reject 400 | reject 400 |
+| `POST /api/challenges/cancel` | ALLOW | ALLOW | reject 400 | reject 400 | reject 400 |
+| `POST /api/game/start` (reconnect) | searching | searching | reconnect | searching | searching |
+
+⚠ = the status should be rejected but is not; each such cell carries a
+strict xfail (`BUG(status-gate/question)`, `BUG(status-gate/answer)`,
+`BUG(status-gate/give-up)`) alongside the passing current-behavior pin.
+
+### Findings
+
+- **The lifecycle routes gate correctly and strictly.** `friend/join`
+  accepts only `waiting`, `challenges/accept` only `pending`,
+  `challenges/cancel` only `waiting`/`pending`, and the `/start`
+  reconnect scan only ever picks up `active` matches (everything else
+  falls through to `"searching"` and leaves the seeded match untouched).
+  One shape quirk: accepting a `waiting` match is rejected as **403**
+  (the `player2_id is None` invitee check fires before the status
+  check), not 400 like every other wrong-status accept.
+- **The gameplay routes barely gate at all.** `question` and `answer`
+  reject only `completed`; `waiting`, `pending` and `abandoned` matches
+  serve rounds and score answers exactly like `active` ones. These are
+  the matrix-level restatements of known bugs 8 (abandoned zombies), 9
+  (pending challenges playable without accept) and 30 (creator
+  solo-completes a `waiting` match, re-pinned here end-to-end 3-0
+  against a `player2_id: None` opponent).
+- **`give-up` has NO status check whatsoever** — the only route that
+  does not even reject `completed`. A realistic completed match (final
+  round has a winner) answers `200 {"status": "already_ended"}`, and a
+  completed match with a still-open round processes a full give-up flow
+  (`gave_up`, flag recorded, "waiting for opponent"), where
+  question/answer on the same match return 400. Four xfail cells.
+- **The status poll is open to every status by design** (read-only
+  polling endpoint) — asserted allowed for all five statuses, no xfail.
+- **Transitions flip the gates as expected**: `waiting → active →
+  completed` (join + first-to-3: join/cancel/accept die at `active`,
+  everything mutating dies at `completed` while polling still works),
+  `pending → active` (accept is one-shot; cancel dies with it), and
+  `active → abandoned` via the stale `/start` scan (no reconnect
+  offered, join/cancel rejected, polling reports `abandoned` — but the
+  flip is memory-only, re-pinning bug 35, and the zombie stays playable,
+  bug 8).
+
+### How to run
+
+```bash
+# Status-gate matrix suite only (58 tests: 48 pass, 10 xfail)
+python3 -m pytest tests/test_match_status_gate_edge_cases.py -q
+
+# Full repository suite (1026 tests: 972 pass, 54 xfail)
+python3 -m pytest tests/ -q
+```
+
+All ten xfails are `strict` and sit next to passing parametrized pins of
+the current behavior, matching the campaign convention.
