@@ -1446,8 +1446,26 @@ async def get_active_match(current_user = Depends(get_current_user)):
 async def get_match_by_code(match_code: str, current_user = Depends(get_current_user)):
     """Get match details by match code"""
     user_id = str(current_user["_id"])
+    code = match_code.strip().upper()
     
-    # Find match by code
+    # Find match by code in memory first
+    match = None
+    for mid, m in in_memory_matches.items():
+        if m.get("match_code") == code or m.get("match_code") == match_code.strip():
+            match = m
+            break
+    
+    # Fallback to database lookup if not in memory
+    if not match:
+        match = await matches_collection.find_one({"match_code": code})
+        if not match and code != match_code.strip():
+            match = await matches_collection.find_one({"match_code": match_code.strip()})
+        if match:
+            in_memory_matches[match["_id"]] = match
+    
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
     from bson import ObjectId, errors as bson_errors
     def is_valid_objectid(oid):
         try:
@@ -1456,46 +1474,42 @@ async def get_match_by_code(match_code: str, current_user = Depends(get_current_
         except bson_errors.InvalidId:
             return False
 
-    for match_id, match in in_memory_matches.items():
-        if match.get("match_code") == match_code:
-            # Verify user is part of this match
-            if str(match["player1_id"]) == user_id or str(match["player2_id"]) == user_id:
-                # Determine if current user is player1 or player2
-                is_player1 = str(match["player1_id"]) == user_id
-                opponent_id = match["player2_id"] if is_player1 else match["player1_id"]
+    p1_id = str(match["player1_id"])
+    p2_id = str(match["player2_id"]) if match.get("player2_id") is not None else None
 
-                # Get opponent info only if valid ObjectId
-                if is_valid_objectid(opponent_id):
-                    opponent_user = await users_collection.find_one({"_id": ObjectId(opponent_id)})
-                    opponent_name = opponent_user.get("username", opponent_user.get("name", "Opponent")) if opponent_user else "Opponent"
-                else:
-                    opponent_user = None
-                    if "guest" in str(opponent_id):
-                        opponent_name = "Guest"
-                    elif "bot" in str(opponent_id):
-                        opponent_name = "Bot"
-                    else:
-                        opponent_name = "Player"
+    # Verify user is part of this match
+    if user_id == p1_id or (p2_id is not None and user_id == p2_id):
+        is_player1 = user_id == p1_id
+        opponent_id = match.get("player2_id") if is_player1 else match.get("player1_id")
 
-                # Check if opponent is bot (if they're a string ID like 'bot-opponent')
-                is_opponent_bot = isinstance(opponent_id, str) and ("bot" in str(opponent_id) or opponent_name.endswith('(bot)'))
-
-                return {
-                    "match_id": match_id,
-                    "status": match.get("status"),
-                    "player1_id": str(match["player1_id"]),
-                    "player2_id": str(match["player2_id"]),
-                    "player1_score": match.get("player1_score", 0),
-                    "player2_score": match.get("player2_score", 0),
-                    "current_round": match.get("current_round", 0),
-                    "is_player1": is_player1,
-                    "opponent_name": opponent_name,
-                    "is_opponent_bot": is_opponent_bot
-                }
+        if opponent_id and is_valid_objectid(opponent_id):
+            opponent_user = await users_collection.find_one({"_id": ObjectId(opponent_id)})
+            opponent_name = opponent_user.get("username", opponent_user.get("name", "Opponent")) if opponent_user else "Opponent"
+        else:
+            opponent_user = None
+            if opponent_id and "guest" in str(opponent_id):
+                opponent_name = "Guest"
+            elif opponent_id and "bot" in str(opponent_id):
+                opponent_name = "Bot"
             else:
-                raise HTTPException(status_code=403, detail="Not authorized to access this match")
-    
-    raise HTTPException(status_code=404, detail="Match not found")
+                opponent_name = "Opponent"
+
+        is_opponent_bot = isinstance(opponent_id, str) and ("bot" in str(opponent_id) or opponent_name.endswith('(bot)'))
+
+        return {
+            "match_id": match["_id"],
+            "status": match.get("status"),
+            "player1_id": p1_id,
+            "player2_id": p2_id if p2_id is not None else "None",
+            "player1_score": match.get("player1_score", 0),
+            "player2_score": match.get("player2_score", 0),
+            "current_round": match.get("current_round", 0),
+            "is_player1": is_player1,
+            "opponent_name": opponent_name,
+            "is_opponent_bot": is_opponent_bot
+        }
+    else:
+        raise HTTPException(status_code=403, detail="Not authorized to access this match")
 
 
 def _question_response(round_id: str, round_doc: dict, round_start_time) -> dict:
