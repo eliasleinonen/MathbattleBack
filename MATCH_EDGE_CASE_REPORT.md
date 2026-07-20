@@ -413,3 +413,113 @@ the code paths differ.
   correct (`already_won: true`, `message: "Time limit exceeded"`); three
   timeouts lose the match, set `winner_id: "bot-opponent"`, and deduct ELO
   from the human (loss recorded), after which further answers are 400.
+
+## Question serving & round progression (`/api/game/question`, `_create_next_round`, `_question_response`)
+
+Findings from `tests/test_match_question_and_round_edge_cases.py` (68 tests:
+66 pass, 2 strict `xfail` documenting real bugs). Difficulty selection was
+observed with a `generate_question` spy that records the ELO argument; the
+Mongo `rounds` array bookkeeping was observed by recording every
+`matches_collection.update_one` call. Concurrency was exercised by calling
+`get_question` directly under `asyncio.gather` (with a fresh per-match lock
+for the test's event loop).
+
+### Bugs (xfail tests)
+
+1. **Tie rounds desync the Mongo rounds-array numbering** —
+   `test_round_summary_number_should_match_round_doc_after_tie` (xfail).
+   `_create_next_round` numbers the round *doc* by counting existing rounds
+   (`round_count + 1`) but numbers the summary it `$push`es into the match's
+   `rounds` array by `player1_score + player2_score + 1`. Wins keep the two
+   in sync; **any tie** (double give-up or 5-minute timeout) leaves the
+   scores unchanged, so the next round doc is numbered N+1 while its Mongo
+   summary repeats number N. From then on the array holds duplicate
+   `round_number` entries, and every winner/tie update that filters on
+   `{"rounds.round_number": ...}` positionally hits the wrong entry — or,
+   for the freshly created round's real number, **no entry at all** (pinned
+   by `test_current_behavior_tie_desyncs_mongo_round_numbers`: after one tie
+   the array is `[1, 1]` while the live round is number 2, and round 2's tie
+   update targets a `round_number: 2` that no array element has).
+
+2. **Round ids are reused after round-cache loss** —
+   `test_round_ids_should_stay_unique_after_round_cache_loss` (xfail).
+   The "deterministic" id `round-{match_id}-{n}` derives `n` from the number
+   of that match's rounds currently in `in_memory_rounds`. If the rounds
+   cache is lost while the match survives (restart, eviction, another
+   worker), the count restarts at zero and the next question reissues
+   `round-<match>-1`: the original round's history is overwritten in memory
+   (its `winner_id` is forgotten, though the score it paid survives on the
+   match), and because a round with that `_id` already exists in Mongo the
+   insert is skipped — the DB keeps the OLD question while players are shown
+   the new one. Pinned by
+   `test_current_behavior_round_cache_loss_reuses_round_one_id`.
+
+### Core behavior verified (passing tests)
+
+- **Difficulty always uses the lower of the two ELO snapshots**
+  (`min(player1_elo, player2_elo)`), whichever side is weaker and however
+  wide the gap (2500 vs 800 → questions for 800), so both players see the
+  same question at the weaker player's level. With the real generator,
+  1000/1000 pairs get difficulty 1–2 (`elo < 1200` branch) and 2000+ pairs
+  get difficulty 3.
+- **Resume semantics**: while the current round has no `winner_id`, every
+  `/question` call from either player returns the identical payload
+  (`round_id`, `expression`, `evaluate_at`, `round_start_time`); wrong
+  answers don't advance anything. A new round is created only after a
+  winner or tie, with `round_number` incrementing 1, 2, 3… (ties included)
+  and per-match numbering fully independent across concurrent matches.
+- **First-to-3 lifecycle**: three won rounds produce three unique
+  sequential round ids, flip the match to `completed`, and the fourth
+  `/question` is rejected with `400 "Match is already completed"`.
+- **Concurrency is safe on one worker**: simultaneous first-question
+  requests, simultaneous next-question requests right after a win, and
+  duplicate requests from the same player all resolve to a single shared
+  round under the per-match lock (exactly one round created, both players
+  on the same `round_id`).
+- **Response shape**: exactly
+  `{round_id, expression, evaluate_at, ask_for_derivative_only,
+  round_start_time}` (+ `time_limit` for bot rounds); the answer/derivative
+  never leak. `ask_for_derivative_only` is always present — defaulted to
+  `True` if the generator omits it, passed through when `False`.
+  `round_start_time` is a timezone-aware UTC ISO string aimed ~3s into the
+  future; the resume path echoes the exact same string.
+- **Stale-round timeout**: a round older than 5 minutes is marked
+  `winner_id: "tie"` (no points) and a fresh round is created on the next
+  poll; 299s-old rounds are still served; ISO-string `created_at` (Mongo
+  round-trip) is parsed correctly; an unparseable `created_at` never times
+  out (round is resumed, no crash).
+
+### Bot vs human differences (case-by-case)
+
+- Only bot matches (`match_type == "random"` **and**
+  `player2_id == "bot-opponent"`) get `time_limit`; friend and ranked
+  human rounds omit the key entirely (absent, not `null`).
+- `time_limit = base(player1_elo) + difficulty`, brackets inclusive:
+  ≤1000 → 15, ≤1400 → 12, ≤1800 → 10, >1800 → 8 (+1s per difficulty
+  level). The resume path carries the same `time_limit`.
+- **Two different ELOs feed one bot round**: difficulty uses
+  `min(elo)` = the bot's (spawned 50–150 below the user), while
+  `time_limit` uses the *user's* ELO. Otherwise the bot path shares the
+  exact creation path (same deterministic ids, same fields modulo
+  `time_limit`).
+
+### Error paths & failure handling
+
+- Unknown, case-mismatched, whitespace-padded, unicode, injection-ish and
+  empty match ids are all clean 404s (`"Match not found"`); a missing
+  `match_id` query param is a 422. Outsiders get `403 "Not your match"`
+  before anything else (even on completed matches) and never pollute
+  presence or create rounds. A match known only to Mongo is loaded, cached
+  into memory and served normally.
+- **Completed matches cannot get new questions** (task-list case 11
+  resolved: 400, checked explicitly). **Abandoned matches still can** —
+  the zombie-match bug already xfailed in the presence suite; this suite
+  pins the round-creation side (an abandoned match serves round 1, accepts
+  the win and serves round 2).
+- `generate_question` failures (exception, missing keys, `None` return)
+  surface as the generic 500 from the global handler with no internals
+  leaked and **no half-created round state** (`current_round_id` stays
+  unset, zero rounds stored) — except the quirk that `round_start_time` is
+  stamped on the match before the round doc is built, so it survives the
+  crash. The match fully recovers: the next poll with a healthy generator
+  creates round 1 normally.
