@@ -28,8 +28,8 @@ throughout.
 
 ### Test inventory
 
-25 dedicated edge-case suites, **1124 edge-case tests collected**.
-Full repository suite: **1160 collected → 1097 passed, 63 xfailed**.
+27 dedicated edge-case suites, **1195 edge-case tests collected**.
+Full repository suite: **1231 collected → 1148 passed, 83 xfailed**.
 Every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail markers |
@@ -45,8 +45,10 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_cancel_and_queue_lifecycle_edge_cases.py` | 25 | 4 |
 | `tests/test_match_datetime_and_memory_edge_cases.py` | 46 | 3 |
 | `tests/test_match_giveup_status_edge_cases.py` | 56 | 2 |
+| `tests/test_match_grading_expiry_deep_edge_cases.py` | 41 | 7 |
 | `tests/test_match_history_and_listing_edge_cases.py` | 33 | 6 |
 | `tests/test_match_isolation_and_access_edge_cases.py` | 38 | 2 |
+| `tests/test_match_lock_concurrency_deep_edge_cases.py` | 30 | 2 |
 | `tests/test_match_math_equivalence_in_pvp_edge_cases.py` | 117 | 3 |
 | `tests/test_match_misc_people_edge_cases.py` | 24 | 0 |
 | `tests/test_match_mongo_hydrate_edge_cases.py` | 26 | 2 |
@@ -59,9 +61,9 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_status_gate_edge_cases.py` | 58 | 3 |
 | `tests/test_match_win_completion_edge_cases.py` | 33 | 1 |
 | `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
-| **Edge-case total** | **1124** | **56** |
+| **Edge-case total** | **1195** | **65** |
 
-The full repository suite collects 1160 tests and runs as 1097 passed, 63 xfailed.
+The full repository suite collects 1231 tests and runs as 1148 passed, 83 xfailed.
 
 ### Severity-ranked bug list
 
