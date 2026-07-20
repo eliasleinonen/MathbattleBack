@@ -32,7 +32,7 @@ MONGODB_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
 DATABASE_NAME = "derivative_duel"
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://mathbattle.xyz")
 # Google OAuth: sign-in and daily challenges require this to be set in the environment.
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip().strip('"').strip("'")
 
 if not GOOGLE_CLIENT_ID:
     print("[WARNING] GOOGLE_CLIENT_ID is not set - Google login and daily challenges will be unavailable")
@@ -322,12 +322,29 @@ async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] =
         if email is None:
             return default_guest
         
-        # Get user from database
-        user = await users_collection.find_one({"email": email})
-        if user is None:
-            return default_guest
+        if email in in_memory_users:
+            return in_memory_users[email]
+
+        try:
+            user = await users_collection.find_one({"email": email})
+            if user:
+                in_memory_users[email] = user
+                in_memory_users[str(user["_id"])] = user
+                return user
+        except Exception as e:
+            logger.warning("MongoDB user lookup failed in get_current_user: %s", e)
         
-        return user
+        fallback_user = {
+            "_id": email,
+            "email": email,
+            "name": email.split("@")[0],
+            "elo": 1000,
+            "wins": 0,
+            "losses": 0,
+            "created_at": datetime.utcnow()
+        }
+        in_memory_users[email] = fallback_user
+        return fallback_user
         
     except JWTError:
         return default_guest
@@ -882,8 +899,9 @@ async def google_auth(auth_request: GoogleAuthRequest):
     # GoogleAuthError for a wrong issuer; both mean the token is untrustworthy.
     try:
         idinfo = verify_google_token(auth_request.token)
-    except (ValueError, GoogleAuthError):
-        raise HTTPException(status_code=401, detail="Invalid Google token")
+    except (ValueError, GoogleAuthError) as e:
+        logger.warning("Google token verification failed: %s", e)
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
 
     email = idinfo.get("email")
     if not email:
@@ -896,16 +914,37 @@ async def google_auth(auth_request: GoogleAuthRequest):
     name = idinfo.get("name") or email.split("@")[0]
 
     # Upsert: create the user on first sign-in, otherwise keep their existing record.
-    user = await users_collection.find_one({"email": email})
+    user = None
+    try:
+        user = await users_collection.find_one({"email": email})
+        if user is None:
+            new_user = {
+                "email": email,
+                "name": name,
+                "elo": 1000,
+                "wins": 0,
+                "losses": 0,
+                "created_at": datetime.now(timezone.utc),
+            }
+            res = await users_collection.insert_one(new_user.copy())
+            new_user["_id"] = res.inserted_id
+            user = new_user
+    except Exception as e:
+        logger.warning("MongoDB user lookup/creation failed in google_auth: %s", e)
+
     if user is None:
-        await users_collection.insert_one({
+        user = {
+            "_id": email,
             "email": email,
             "name": name,
             "elo": 1000,
             "wins": 0,
             "losses": 0,
             "created_at": datetime.now(timezone.utc),
-        })
+        }
+
+    in_memory_users[email] = user
+    in_memory_users[str(user["_id"])] = user
 
     access_token = create_access_token({"sub": email})
     return {"access_token": access_token, "token_type": "bearer"}
