@@ -18,9 +18,11 @@ Scope:
 - evaluate_at-style numeric questions (ask_for_derivative_only False), driven
   by monkeypatching generate_question, exercising the abs<0.1 tolerance branch.
 - SymPy inputs that could crash grading: all are caught and graded wrong with
-  200 (never 500); the one genuine failure — an unbounded integer power that
-  hangs grading forever (no timeout) — is pinned with a subprocess watchdog
-  and a strict xfail.
+  200 (never 500); the two genuine failures — an unbounded integer power that
+  hangs parse_expr, and a symbolic power tower that hangs the NUMERIC
+  fallback when the random sample point is large — are each pinned with a
+  subprocess watchdog and a strict xfail (the tower additionally has a
+  deterministic passing test with the sample point pinned small).
 
 See MATCH_EDGE_CASE_REPORT.md for the campaign summary.
 """
@@ -418,7 +420,6 @@ def test_boolean_answer_on_numeric_question_is_graded_wrong(
         "1/0",  # zero division on evaluate
         "x/0",
         "factorial(50000)",  # huge but finite -> not equal, no hang
-        "x**x**x**x**x",  # symbolic tower, no numeric blowup
         "sqrt(-4)*x*I/1",  # complex
         "x**(10**6)",  # large symbolic exponent (finite work)
         "oo",  # infinity
@@ -433,15 +434,32 @@ def test_pathological_sympy_answers_return_200_graded_wrong(
     assert body["correct"] is False, pathological
 
 
+def test_power_tower_answer_graded_wrong_when_sampled_at_small_point(
+    client, auth_headers, derivative_question, monkeypatch
+):
+    # The symbolic cascade handles x**x**x**x**x fine (all steps return
+    # False quickly); it is only the NUMERIC fallback that can blow up,
+    # because it substitutes a random point from uniform(1, 10) and asks
+    # mpmath to evaluate the tower there. At small sample points the value
+    # is finite and grading completes; pin the sample point to make that
+    # deterministic (see the xfail below for the hang at larger points).
+    monkeypatch.setattr(main.random, "uniform", lambda a, b: 1.5)
+    body = _grade(client, auth_headers, "x**x**x**x**x", "tower")
+    assert body["correct"] is False
+
+
 # --- the one genuine crash: an unbounded integer power that HANGS grading ---
 
 
-def _pvp_grade_worker(answer, result_queue):
+def _pvp_grade_worker(answer, result_queue, pin_uniform=None):
     """Self-contained: stub Mongo, serve a round, submit `answer`, report status.
 
     Runs in a forked child so a hang can be killed without taking down the
     test process. Top-level (picklable) per the no-inline-import rule; the
     heavy imports it needs are already loaded in the parent and inherited.
+
+    `pin_uniform` pins random.uniform (the numeric fallback's sample point)
+    so tests that depend on WHERE the fallback evaluates are deterministic.
     """
     import os
 
@@ -490,6 +508,8 @@ def _pvp_grade_worker(answer, result_queue):
         "difficulty": 1,
         "ask_for_derivative_only": True,
     }
+    if pin_uniform is not None:
+        main.random.uniform = lambda a, b: pin_uniform
 
     client = TestClient(main.app)
     auth = lambda g: {"Authorization": f"Bearer {g}"}
@@ -506,7 +526,7 @@ def _pvp_grade_worker(answer, result_queue):
     result_queue.put(response.status_code)
 
 
-def _grade_with_timeout(answer, timeout):
+def _grade_with_timeout(answer, timeout, pin_uniform=None):
     """Return the HTTP status, or None if grading did not finish in `timeout`s.
 
     Uses a `spawn` child (fresh interpreter) rather than `fork`: by the time
@@ -516,7 +536,7 @@ def _grade_with_timeout(answer, timeout):
     """
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
-    proc = ctx.Process(target=_pvp_grade_worker, args=(answer, queue))
+    proc = ctx.Process(target=_pvp_grade_worker, args=(answer, queue, pin_uniform))
     proc.start()
     proc.join(timeout)
     if proc.is_alive():
@@ -543,3 +563,27 @@ def test_grade_with_timeout_harness_reports_finish_for_normal_answer():
 def test_unbounded_integer_power_answer_does_not_hang_grading():
     finished = _grade_with_timeout("9**9**9", timeout=12) is not None
     assert finished, "grading hung on '9**9**9' (no timeout guard)"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "BUG (DoS, second entry point): the numeric fallback substitutes a "
+        "random point from uniform(1, 10) into the user's expression and "
+        "evaluates it with N(). For a symbolic power tower like "
+        "'x**x**x**x**x' the tower is astronomically large at most of that "
+        "range (only samples below ~2 stay finite), so with ~85% probability "
+        "per attempt mpmath grinds forever and the request never returns - "
+        "the same one-request wedge as '9**9**9', reached through subs/N "
+        "instead of parse_expr. The fallback needs the same work bound / "
+        "timeout as the parser."
+    ),
+)
+def test_power_tower_should_not_hang_numeric_fallback_at_large_sample_points():
+    # Pin the sample point to 9.0 (representative of most of uniform(1, 10))
+    # so the hang is deterministic instead of an ~85% coin flip.
+    finished = _grade_with_timeout("x**x**x**x**x", timeout=12, pin_uniform=9.0)
+    assert finished is not None, (
+        "grading hung evaluating x**x**x**x**x at x=9 (numeric fallback has "
+        "no timeout guard)"
+    )
