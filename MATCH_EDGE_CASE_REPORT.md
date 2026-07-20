@@ -28,9 +28,9 @@ throughout.
 
 ### Test inventory
 
-22 dedicated edge-case suites, **1058 edge-case tests collected**
+23 dedicated edge-case suites, **1084 edge-case tests collected**
 (verified with `pytest --collect-only -q`). Full repository suite:
-**1094 collected → 1037 passed, 57 xfailed**.
+**1120 collected → 1061 passed, 59 xfailed**.
 Every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail markers |
@@ -48,6 +48,7 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_history_and_listing_edge_cases.py` | 33 | 6 |
 | `tests/test_match_isolation_and_access_edge_cases.py` | 38 | 2 |
 | `tests/test_match_math_equivalence_in_pvp_edge_cases.py` | 117 | 3 |
+| `tests/test_match_mongo_hydrate_edge_cases.py` | 26 | 2 |
 | `tests/test_match_multiplayer_stress_edge_cases.py` | 54 | 4 |
 | `tests/test_match_newly_found_bugs_edge_cases.py` | 12 | 6 |
 | `tests/test_match_objectid_guest_mixing_edge_cases.py` | 35 | 2 |
@@ -57,10 +58,10 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_status_gate_edge_cases.py` | 58 | 10 |
 | `tests/test_match_win_completion_edge_cases.py` | 33 | 1 |
 | `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
-| **Edge-case total** | **1058** | **57** |
+| **Edge-case total** | **1084** | **59** |
 
 The full repository suite (including pre-existing tests) collects
-1094 tests and runs as 1037 passed, 57 xfailed.
+1120 tests and runs as 1061 passed, 59 xfailed.
 
 ### Severity-ranked bug list
 
@@ -233,6 +234,21 @@ passing tests that assert the broken behavior.
     `test_pending_list_should_expose_all_twelve_spam_challenges`, with
     passing pins for the spam storage, the cap, and hidden challenges
     scrolling into view as older ones are accepted/cancelled.
+28. **A corrupted Mongo doc poisons the memory cache before it is ever
+    validated** (hydrate suite, demonstrated by passing pins). Every
+    hydrate path caches the DB doc into `in_memory_matches` /
+    `in_memory_rounds` *first* and reads its fields afterwards, so a doc
+    missing a load-bearing field (`player2_id`, `player1_elo`, scores,
+    `status`, a round's `answer`) 500s the request **and** leaves the
+    broken doc cached — every later request re-crashes off the cached
+    copy and the DB (which may have been repaired) is never re-read
+    until a restart.
+29. **A mid-`question` crash strands a half-created round** (hydrate
+    suite, demonstrated by a passing pin). `_create_next_round` stores
+    the round in memory and inserts it into `rounds_collection` *before*
+    reading the match's scores for the summary `$push`; on a match doc
+    missing `player1_score` the request 500s after the insert, leaving a
+    fully persisted round that the match doc never references.
 
 ### Recommended fix order
 
@@ -280,25 +296,11 @@ passing tests that assert the broken behavior.
 ### How to run the tests
 
 ```bash
-# Full suite (832 tests: 803 pass, 29 xfail)
+# Full suite (1120 tests: 1061 pass, 59 xfail)
 python3 -m pytest tests/ -q
 
-# Edge-case campaign only (796 tests: 767 pass, 29 xfail)
-python3 -m pytest tests/test_ranked_matchmaking_edge_cases.py \
-  tests/test_friend_match_edge_cases.py \
-  tests/test_challenge_match_edge_cases.py \
-  tests/test_match_presence_and_lifecycle_edge_cases.py \
-  tests/test_elo_and_match_completion_edge_cases.py \
-  tests/test_match_answer_and_scoring_edge_cases.py \
-  tests/test_match_question_and_round_edge_cases.py \
-  tests/test_match_datetime_and_memory_edge_cases.py \
-  tests/test_match_isolation_and_access_edge_cases.py \
-  tests/test_bot_fallback_and_timeout_edge_cases.py \
-  tests/test_match_cancel_and_queue_lifecycle_edge_cases.py \
-  tests/test_match_api_contract_edge_cases.py \
-  tests/test_match_math_equivalence_in_pvp_edge_cases.py \
-  tests/test_match_multiplayer_stress_edge_cases.py \
-  tests/test_match_auth_identity_edge_cases.py -q
+# Edge-case campaign only (1084 tests: 1025 pass, 59 xfail)
+python3 -m pytest tests/test_*edge_cases*.py -q
 
 # Verify the inventory
 python3 -m pytest --collect-only -q tests/
@@ -2411,3 +2413,110 @@ python3 -m pytest tests/ -q
 
 The xfail is `strict` with a passing current-behavior sibling pin,
 matching the campaign convention.
+
+## Mongo hydrate & fallback paths (`tests/test_match_mongo_hydrate_edge_cases.py`)
+
+Findings from `tests/test_match_mongo_hydrate_edge_cases.py`
+(26 tests: 24 pass, 2 xfail). conftest's default mocks answer `None` to
+every `find_one`, so the rest of the campaign mostly exercises the pure
+in-memory paths. This suite backs `matches_collection` and
+`rounds_collection` with stateful fakes (`FakeMatchesDB` /
+`FakeRoundsDB`, the challenge/history-suite pattern: deepcopies at the
+driver boundary, flat-equality plus positional `rounds.round_number`
+filters, `$set` incl. `rounds.$.` and `$push` updates, and a
+`find_one_calls` counter) so the DB can actually *return* documents, and
+walks every hydrate branch for people matches.
+
+### Bugs (xfail, both strict re-pins of known bugs)
+
+- **`status` hydrates the match but never the round** — re-pin of
+  `BUG(status-no-round-hydration)` (bug 2 of the newly-found-bugs
+  suite) from the DB-seeded side: with both docs in Mongo and neither
+  in memory, the poll serves the match half fine (`player1_score`
+  hydrated) but reports the resolved round's winner as `None`, and the
+  `find_one_calls` counter proves the rounds collection receives
+  **zero** reads (`test_status_should_hydrate_current_round_from_db`).
+- **`/api/game/match/{code}` performs zero DB reads** — re-pin of
+  `BUG(by-code-no-db-fallback)`: the by-code route 404s on a DB-only
+  match and the counter shows it never even queried
+  `matches_collection`
+  (`test_by_code_should_hydrate_match_from_db`).
+
+### The hydrate matrix (asserted in passing tests)
+
+| Route | Match doc | Round doc | Cached back? | Writes back? |
+|---|---|---|---|---|
+| `question` | hydrates | never (re-creates instead, bug 11) | yes | round insert + `current_round_id`/`$push` on the match |
+| `answer` | hydrates | hydrates | yes (both) | winner/answer to rounds, score + positional `rounds.$` to matches |
+| `give-up` | hydrates | hydrates | yes (both) | give-up flags (and tie) to rounds |
+| `status/{id}` | hydrates | **never** (xfail) | match only | presence only (memory) |
+| `friend/join` | hydrates by code | n/a | **no** | join written to the DB doc only |
+| `friend/status/{code}` | hydrates by code | n/a | **no** | nothing (read-only) |
+| `match/{code}` | **never** (xfail) | n/a | no | nothing |
+| `active` | **never** (memory scan only, zero reads) | n/a | no | nothing |
+
+- A DB-only waiting friend match is fully joinable (lower-case code
+  upper-cased, join written back to the DB doc), and the whole flow then
+  works DB-first: `join` → `question` hydrates the now-active doc and
+  serves the same round 1 to both players → `answer` scores. But `join`
+  and `friend/status` are hydrate-for-the-request only: neither caches
+  the doc into `in_memory_matches`, unlike question/answer/give-up/
+  status. `/api/game/active` reports `has_active_match: false` for a
+  DB-only active match (zero DB reads) until any hydrating route runs,
+  after which it flips to `true`.
+- Hydration happens **before** the status gate: probing a completed
+  DB-only match with `question` 400s but still pulls the dead match
+  into the memory cache.
+- Give-up on a hydrated already-resolved round short-circuits to
+  `already_ended` without mutating either store.
+
+### Corrupted / oversized documents
+
+- **Missing load-bearing fields 500 and poison the cache** (bug 28): a
+  match doc missing `player2_id` or `player1_elo` (question), scores or
+  `status` (status), or a round doc missing `answer` (answer) crashes
+  the request with a `KeyError` 500 — *after* the doc was cached, so
+  every subsequent request re-crashes off the cached copy without ever
+  re-reading the (possibly repaired) DB.
+- **Write ordering strands a half-created round** (bug 29): on a match
+  doc missing `player1_score`, `question` 500s only after the round was
+  stored in memory *and* inserted into `rounds_collection`; the match
+  doc never learns about it (`rounds` array never pushed).
+- `status` tolerates a *minimal* doc — identity, scores and `status`
+  are the only hard requirements; `winner_id`/`elo_change`/
+  `round_start_time`/`current_round_id` all default cleanly through
+  `.get`.
+- **Extra unexpected fields are harmless and preserved**: legacy blobs,
+  unknown ids and nested junk ride along into the memory cache
+  untouched and never leak into the response shape (status response
+  keys stay exactly the documented 15).
+
+### Memory-vs-DB precedence and write-backs
+
+- **After one hydrate read, memory wins forever**: diverge the cached
+  doc (score 2) from the DB doc (score 5) and the poll serves memory;
+  the `find_one_calls` counter stays at 1 — the DB is never re-read.
+- **Write-backs after a full hydrate land in both collections**: a
+  correct answer on a match+round that lived only in Mongo writes the
+  round winner and answer to the rounds doc *and* the score plus the
+  positional `rounds.$` entry to the match doc (the seeded doc carries
+  a real `rounds` array, so the positional update applies exactly as
+  in Mongo). A wrong answer durably records the attempt while leaving
+  the round open.
+- **Membership is enforced before any write-back**: an outsider probing
+  a DB-only match gets 403 on all four gameplay routes and neither
+  collection sees a single mutation.
+
+### How to run
+
+```bash
+# Hydrate/fallback suite only (26 tests: 24 pass, 2 xfail)
+python3 -m pytest tests/test_match_mongo_hydrate_edge_cases.py -q
+
+# Full repository suite (1120 tests: 1061 pass, 59 xfail)
+python3 -m pytest tests/ -q
+```
+
+Both xfails are `strict` re-pins of already-catalogued bugs
+(`status-no-round-hydration`, `by-code-no-db-fallback`), each with a
+passing current-behavior sibling pin, matching the campaign convention.
