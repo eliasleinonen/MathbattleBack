@@ -680,15 +680,6 @@ def test_get_match_by_code_waiting_match_reports_stringified_none(
     assert body["player2_id"] == "None"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG/inconsistency: /api/game/friend/join and /api/game/friend/status "
-        "normalize the code with .upper(), but /api/game/match/{match_code} "
-        "compares case-sensitively, so a lowercase code that works everywhere "
-        "else 404s here."
-    ),
-)
 def test_get_match_by_code_accepts_lowercase_code(client, auth_headers):
     created = _create(client, auth_headers, PLAYER_A)
     assert _join(client, auth_headers, created["match_code"], PLAYER_B).status_code == 200

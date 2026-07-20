@@ -525,15 +525,6 @@ def test_friend_status_hydrates_match_from_db(client, fake_matches_db):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BUG(by-code-no-db-fallback): get_match_by_code scans "
-        "in_memory_matches only.  A live match present in Mongo but not in "
-        "memory 404s on the by-code route while question/answer/give-up/"
-        "status all hydrate it fine."
-    ),
-)
 def test_by_code_should_hydrate_match_from_db(
     client, fake_matches_db, auth_headers
 ):
