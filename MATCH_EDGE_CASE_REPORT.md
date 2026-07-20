@@ -1609,3 +1609,125 @@ No new bug is filed here: the self-match gap (case 9) and the
 change-token-lockout (case 8) are inherent to demo-mode auth and are
 documented as current behavior rather than defects to fix in isolation;
 they resolve once real authentication (bug 26 / the fix-order §9 item) lands.
+
+## Newly found (audit pass)
+
+A second bug-hunting pass over the match code, diffed against all fifteen
+existing suites and this report, surfaced **six previously untested bugs**.
+Each is pinned in `tests/test_match_newly_found_bugs_edge_cases.py`
+(12 tests: 6 strict xfail + 6 passing current-behavior pins). With this
+file the full repository suite collects 844 tests and runs as
+**809 passed, 35 xfailed**.
+
+### New bugs (severity-ranked)
+
+28. **P1 — Hydrated give-up flags erase the opponent's persisted give-up**
+    (xfail `test_hydrated_opponent_give_up_should_survive_and_tie_the_round`).
+    `give_up_round`'s initialization block resets **both** `*_gave_up`
+    flags to `False` whenever the caller's own key is missing from the
+    round doc. Because a give-up only ever `$set`s the giver's single
+    field to Mongo (the `False` pair for the other flag lives in memory
+    only), any round hydrated from the DB carries exactly one flag — so
+    after a restart/eviction/worker switch, the *other* player's give-up
+    wipes the persisted one instead of completing the both-gave-up tie.
+    The round that should tie stays open, Mongo ends up saying "both gave
+    up" while memory says only one did, and the first giver must give up
+    a **second** time to get the tie they already earned. Pinned by
+    `test_current_behavior_hydrated_give_up_erases_opponent_flag`.
+
+29. **P1 — `get_game_status` never hydrates the current round, so a
+    resolved round's result vanishes from the poll after a memory wipe**
+    (xfail `test_status_should_report_round_winner_persisted_in_mongo`).
+    Unlike `submit_answer` and `give_up_round`, which both fall back to
+    `rounds_collection` on a cache miss, the status poller reads round
+    state only via `current_round_id in in_memory_rounds`. After a wipe,
+    the current round's `winner_id` (and both gave-up flags) are in Mongo
+    but the poll reports `round_winner: None` / `False` — a client
+    waiting on the status poll for the round result never sees it (while
+    the score, which lives on the match doc, *does* survive, leaving the
+    client on a board that says 1-0 with apparently nobody having won a
+    round). Pinned by
+    `test_current_behavior_round_result_vanishes_from_status_after_wipe`.
+
+30. **P1 — A creator can solo-play and solo-complete a `waiting`
+    (unjoined) friend match**
+    (xfail `test_answer_on_unjoined_waiting_match_should_not_score`).
+    Gameplay routes only reject status `completed`, and the friend-match
+    branch of `submit_answer` awards the round to whoever answers first —
+    which, on a match nobody has joined, is always the creator playing
+    alone. Three correct answers complete the never-joined match 3-0
+    with `winner_id` set and `player2_id` still `None`, after which the
+    invited friend's join is bounced with the misleading
+    `400 "Match already started"`. This is the `waiting`-status sibling
+    of bug 9 (pending challenges playable without accepting), but worse:
+    it reaches full completion with a winner against nobody. Pinned
+    end-to-end by
+    `test_current_behavior_creator_solo_completes_waiting_match`.
+
+31. **P2 — `/api/game/match/{code}` has no DB fallback**
+    (xfail `test_match_by_code_should_hydrate_from_db_like_other_routes`).
+    Every other gameplay route (`question`, `answer`, `give-up`,
+    `status`) hydrates a match from Mongo on a memory miss; the by-code
+    lookup scans `in_memory_matches` only. After a restart with a
+    perfectly healthy DB, the by-code route 404s a live match until some
+    *other* endpoint happens to cache it back into memory — pinned by
+    `test_current_behavior_by_code_404s_until_another_route_hydrates`,
+    which shows the same code flipping 404 → 200 after one status poll.
+    (The previously documented eviction finding covered only the DB-*down*
+    case; the inconsistency with a healthy DB was untested.)
+
+32. **P2 — The by-code response's `current_round` is hardwired to 0**
+    (xfail `test_by_code_current_round_should_track_round_progression`).
+    `get_match_by_code` returns `match.get("current_round", 0)`, but no
+    writer anywhere sets a `current_round` key — rounds are tracked via
+    `current_round_id`. The field is 0 forever, however deep into the
+    match the players are; any client trusting it (e.g. for a "Round N"
+    header or reconnect UI) renders round 0 mid-game. Pinned by
+    `test_current_behavior_by_code_current_round_stuck_at_zero` (round 2
+    live, score 1-0, field still 0).
+
+33. **P2 — `/api/game/active` labels every human guest opponent
+    "AI Opponent"**
+    (xfail `test_active_match_should_not_label_human_guest_as_ai`).
+    The opponent lookup `users_collection.find_one` misses for guest ids
+    and the fallback string assumes the opponent is a bot. A friend match
+    between two humans tells each of them they are playing an AI, while
+    `/api/game/status` labels the very same opponent "Player 2" in the
+    same match — pinned (with that inconsistency) by
+    `test_current_behavior_active_calls_human_guest_ai_opponent`. Same
+    family as bug 23 (`is_opponent_bot` substring check): bot-ness should
+    key on the `"bot-opponent"` sentinel, never on lookup failure.
+
+### Suggested fixes
+
+- **Bug 28**: initialize only the *caller's* missing flag (or default
+  both flags with `round_doc.setdefault(...)`) instead of resetting both;
+  better, persist both flags on first write so hydrated docs are complete.
+- **Bug 29**: give `get_game_status` the same `rounds_collection`
+  fallback (and cache-back) that `submit_answer`/`give_up_round` already
+  have.
+- **Bug 30**: have `get_question`/`submit_answer` reject non-`active`
+  matches (`waiting`/`pending`/`abandoned`) — this also closes bugs 8
+  and 9, which share the status-gating root cause.
+- **Bug 31**: add a `matches_collection.find_one({"match_code": ...})`
+  fallback (plus memory cache-back) to `get_match_by_code`, mirroring
+  `join_friend_match`.
+- **Bug 32**: either derive `current_round` from the live round doc's
+  `round_number` or drop the field from the response.
+- **Bug 33**: label opponents by the `"bot-opponent"` sentinel and fall
+  back to a neutral `"Player"`/`"Guest"` for unknown human ids (one fix
+  alongside bug 23).
+
+### How to run
+
+```bash
+# Newly-found-bugs suite only (12 tests: 6 pass, 6 xfail)
+python3 -m pytest tests/test_match_newly_found_bugs_edge_cases.py -q
+
+# Full repository suite (844 tests: 809 pass, 35 xfail)
+python3 -m pytest tests/ -q
+```
+
+As everywhere else in this campaign, the xfails are `strict`, and each has
+a sibling test pinning the current broken behavior, so a fix (or a
+regression of the pin) surfaces immediately.
