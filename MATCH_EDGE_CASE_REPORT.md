@@ -2806,3 +2806,135 @@ python3 -m pytest tests/ -q
 
 All 18 xfails are `strict` and sit next to passing current-behavior pins,
 matching the campaign convention.
+
+## Deep lock/concurrency suite (`tests/test_match_lock_concurrency_deep_edge_cases.py`)
+
+A dedicated deepening pass on concurrency around the ONE lock the match
+code has (`match_locks` / `get_match_lock`, used only by `get_question`)
+and the mutating endpoints that don't take it (`submit_answer`,
+`give_up_round`, `join_friend_match`, the queue endpoints). **30 tests
+(28 pass, 2 strict `xfail`)**, both xfails pinning one genuinely new bug
+(numbered **42** below). With this file the full repository suite collects
+**1231 tests** and runs as **1148 passed, 83 xfailed**.
+
+Conventions as everywhere in the campaign: "simultaneous" requests are
+route coroutines gathered on one event loop (single-uvicorn-worker
+semantics); DB latency is a monkeypatched Motor method that awaits
+`asyncio.sleep` before returning a deep-copied snapshot, which is exactly
+the shape of a real Mongo round-trip.
+
+### New bug
+
+42. **P1 — Hydration write-back after a concurrent resolution reopens a
+    decided round; points per round are unbounded** (two strict xfails,
+    one root cause). Both `submit_answer` and `give_up_round` hydrate a
+    cache-missed round with `in_memory_rounds[round_id] = round_doc`
+    *before* looking at it. Any hydration that returns after a concurrent
+    call resolved the round clobbers the recorded `winner_id` with its
+    stale winnerless copy — and unlike the known double-score race (bug 2)
+    or the give-up flag race (bug 34), the clobbering request doesn't have
+    to score at all:
+    - a **losing player's WRONG answer** racing the winner's correct one
+      erases the winner and reopens the round; the winner then scores the
+      SAME round again — two points (and counting) from one round
+      (`test_late_wrong_answer_should_not_reopen_a_decided_round` xfail,
+      `test_current_behavior_late_wrong_answer_reopens_the_round_for_a_second_win`
+      pin);
+    - a **give-up** racing a correct answer does the same: the answer's
+      point sticks on the scoreboard but the round doc ends winnerless
+      with only the quitter's flag, and the answerer re-wins it for a
+      second point
+      (`test_concurrent_give_up_should_not_erase_the_answers_round_winner`
+      xfail,
+      `test_current_behavior_give_up_write_back_reopens_the_scored_round`
+      pin).
+    *Fix:* the same one for bugs 2/34/42 — take `get_match_lock(match_id)`
+    in `submit_answer` and `give_up_round`, and never overwrite a cached
+    round that already has a `winner_id` with a hydrated copy that doesn't.
+
+### Known bugs deepened (current-behavior pins, no new numbers)
+
+- **Bug 2 (double-score race), three latency variants.** Symmetric
+  hydration latency mid-match pays BOTH players for one round (1-1 from a
+  single round, far from the match-point/ELO framing of the win suite).
+  *Staggered* latency — the second read returns only after the first racer
+  fully scored and returned — still double-pays, and the surviving round
+  doc credits only the SLOW racer (the fast racer's acknowledged win
+  exists nowhere but in the score). And the *same player's* duplicated
+  request (double-click/retry) scores twice: 2-0 from one round.
+- **Bug 34 (give-up lost update), staggered variant.** Player A's give-up
+  fully completes and is acknowledged before B's hydration even returns —
+  no interleaved flag writes at all — yet B's stale write-back still
+  erases A's flag. The erasure window is the whole hydration latency, not
+  a simultaneous write race. Recovery pin: the round stays stuck until the
+  erased player gives up a second time.
+- **Bug 4 (join race), overwrite variants.** A FOUR-way concurrent join
+  race: all four get `200/active`, and the seat (id *and* the `player2_elo`
+  snapshot) belongs to whichever coroutine wrote last. The first
+  acknowledged joiner is then locked out with 403 "Not your match" while
+  the unauthenticated by-code status keeps telling them the match is
+  active — they have no way to learn they were kicked. The self-join guard
+  is the one check that survives the race: a creator racing a real joiner
+  is still rejected with 400.
+- **Bug 6 (stale cancel flag), concurrent framings.** Cancel *winning* the
+  race against a searcher's start re-queues cleanly (but still leaves the
+  flag). Cancel *losing* it cannot unwind the pairing: the match stands,
+  the flag lingers, and the canceller's next poll silently reconnects them
+  into the match they tried to leave (the reconnect branch consumes no
+  flags). A same-tick start+cancel from one user leaves a clean queue but
+  plants the flag that eats the NEXT pairing, silently dequeuing the
+  innocent opponent too. And when BOTH players cancel one tick after
+  being paired, both stay stuck in the match with both flags primed.
+
+### Lock behavior verified (passing tests)
+
+- **The lock works where it exists.** A ten-caller `get_question`
+  stampede whose round creation yields mid-write (insert + match-doc
+  update both suspend inside the critical section) produces exactly one
+  round, one shared `round_start_time`, one expression. Two players
+  hitting the 300s expiry simultaneously tie round 1 exactly once and
+  both land on the single round 2. A six-shot same-player retry burst
+  with slow writes collapses to one round.
+- **Same lock object, proven behaviorally.** `get_match_lock` returns the
+  identical object across calls, rounds, give-up ties, status polls and
+  completion; manually `acquire()`-ing the stored object stalls a live
+  `get_question` task (nothing created) until `release()` — the endpoint
+  really serializes on THAT object, not a per-call one.
+- **`match_locks` only ever grows** (bug 22 family). Twelve questioned
+  matches ⇒ twelve distinct locks; completing a match, abandoning another
+  through the stale-match scan, even deleting the match doc from
+  `in_memory_matches` (cache eviction) all leave every lock in place, and
+  rehydration reuses the same object. Nothing ever evicts a lock; the
+  dict is unbounded in production.
+- **Status polls are read-mostly-safe but tear.** A 16-poll storm with
+  yielding user lookups leaves match and round state byte-identical
+  (only the heartbeat map changes); polls interleaved with a locked
+  round-creation serve a coherent payload of the half-created round. But
+  `get_game_status` reads round info BEFORE its awaited user lookups and
+  scores AFTER them, so a poll racing a winning answer serves a **torn
+  payload — the new score with the old `round_winner: null`**
+  (`test_status_poll_racing_a_win_serves_a_torn_payload`); the next poll
+  is consistent again. Benign but visible as a one-frame UI glitch.
+- **The lockless answer path can interact with the locked question
+  path.** Right after a round win, a player's next-question poll racing
+  their own (retried) answer lets the answer **blind-snipe the freshly
+  created round** — won before the client ever saw the question and
+  before its synchronized `round_start_time` (≈3s in the future) ever
+  arrived. With the match-doc write yielding while the lock is held, the
+  answer lands mid-creation and the question response hands out an
+  already-decided round. The opposite ordering is clean: the answer
+  bounces off the previous round's winner gate (`already_won`) and the
+  question rolls a fresh winnerless round 2.
+
+### How to run
+
+```bash
+# Deep lock/concurrency suite only (30 tests: 28 pass, 2 xfail)
+python3 -m pytest tests/test_match_lock_concurrency_deep_edge_cases.py -q
+
+# Full repository suite (1231 tests: 1148 pass, 83 xfail)
+python3 -m pytest tests/ -q
+```
+
+Both xfails are `strict` (bug 42) and sit next to passing
+current-behavior pins, matching the campaign convention.
