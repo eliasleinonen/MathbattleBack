@@ -1732,3 +1732,141 @@ As everywhere else in this campaign, the xfails are `strict`, and each has
 a sibling test pinning the current broken behavior, so a fix (or a
 regression of the pin) surfaces immediately.
 
+## Give-up & status polling (`/api/game/give-up`, `/api/game/status/{id}`, `tests/test_match_giveup_status_edge_cases.py`)
+
+56 tests (54 pass, 2 strict `xfail`). A dedicated pass over the niche
+give-up and status-polling edges in people matches, complementing the
+presence/lifecycle suite: give-up before any round exists, give-up on
+already-won/tied/completed rounds, nearly-concurrent give-ups driven
+through `asyncio.gather` over the route coroutines, give-up racing a
+correct answer, status payload completeness per lifecycle state
+(waiting/active/completed/abandoned), the three `round_winner` value
+shapes (player id / `"tie"` / `null`), exact presence-boundary flips
+under a steppable frozen clock, heartbeat bookkeeping, points/ELO
+neutrality of give-ups, repeated give-ups, ranked-vs-friend parity,
+both-players-stale resolution, outsider 403s, and polling while still
+searching. With this file the full repository suite collects **900
+tests** and runs as **863 passed, 37 xfailed**.
+
+### New bug
+
+34. **P1 — Concurrent give-ups on a cache-missed round lose one flag and
+    wedge the round** (xfail
+    `test_concurrent_give_ups_after_round_eviction_should_resolve_tie`).
+    `give_up_round` takes no per-match lock and hydrates a cache-missed
+    round via an awaited `rounds_collection.find_one`. Two concurrent
+    give-ups (both players quitting the same stuck round — exactly the
+    situation after an eviction/restart) each hydrate a **private copy**
+    of the round doc; the second write-back to `in_memory_rounds`
+    clobbers the first player's flag, so **both** callers get
+    `{"status": "gave_up", "waiting_for_opponent": true}` and the round
+    never resolves even though both players gave up. One of them must
+    give up *again* to break the deadlock. Same missing-lock root cause
+    as bug 2 (double-score race) and the same single-field-persistence
+    family as bug 28. Pinned by
+    `test_current_behavior_concurrent_hydrated_give_ups_lose_one_flag`
+    (deterministic interleaving via a yielding `find_one`: player1's flag
+    ends `False`, player2's `True`, `winner_id` stays `None`).
+
+    *Fix:* the same as bug 2 — take `get_match_lock(match_id)` in
+    `give_up_round` (and re-check the cache after the awaited hydrate),
+    which also closes bug 28's erasure window.
+
+### Independent rediscovery of bug 29
+
+`test_status_should_report_round_winner_after_round_cache_eviction`
+(strict xfail) and
+`test_current_behavior_status_forgets_round_result_after_eviction`
+pin the same root cause as bug 29 — `get_game_status` reads round fields
+from `in_memory_rounds` only, with no `rounds_collection` fallback — this
+time via the give-up/tie path: after a double give-up resolves the round
+to `"tie"` and the round doc is evicted, the poll reports
+`round_winner: null` and both gave-up flags `false` forever, while the
+match-doc score survives, so the poller sees a board that contradicts
+itself. Found independently while testing the `round_winner` value
+shapes; kept as a second strict xfail so fixing bug 29 flips both.
+
+### Passing findings worth knowing (current behavior, pinned by tests)
+
+- **Give-up before any round is a clean 404** (`"No active round"`) on
+  friend, ranked and even unjoined `waiting` matches — membership and
+  heartbeat are processed first, so the failed call still marks the
+  caller seen; no round state is created
+  (`test_premature_give_up_leaves_no_round_state_behind`).
+- **`already_ended` echoes any resolved round** — opponent's win, your
+  own win, a `"tie"`, even the final round of a completed match (the
+  champion can "give up" post-victory and just gets
+  `{"status": "already_ended", "round_winner": <self>}` back). An
+  `already_ended` give-up never touches the `*_gave_up` flags.
+- **Concurrent give-ups on the shared in-memory round are safe**: with
+  back-to-back execution one caller waits and the other resolves the
+  tie; with a yielding DB write **both** callers receive the terminal
+  `both_gave_up`/`"tie"` response (double resolution of the same value —
+  harmless). The unsafe path is only the hydrated-copy race of bug 34.
+- **Give-up racing a correct answer**: the answer wins the round and the
+  giver still gets `gave_up`/waiting back although the round is already
+  decided against them; the next status poll shows both the giver's flag
+  and the answerer's `round_winner`
+  (`test_give_up_racing_a_correct_answer_lets_the_answer_win`).
+- **Status payload is shape-stable across all four lifecycle states** —
+  the same 15 keys for waiting/active/completed/abandoned; `waiting`
+  keeps the known `player2_id: "None"` quirk plus a "connected"
+  never-seen ghost opponent; `abandoned` reports `round_start_time:
+  null`; completed ranked matches report the positive `elo_change` while
+  friend matches stay 0.
+- **`round_winner` takes exactly three shapes** — a player id after a
+  win, the literal string `"tie"` after a double give-up, `null` while
+  undecided — and resets to `null` the moment the next round starts
+  while the score persists.
+- **Presence boundary is exact and per-player**: 12.000000s since the
+  opponent's last heartbeat still reports `opponent_connected: true`,
+  one microsecond more flips it to `false`, and one opponent poll flips
+  it straight back. A player's own frantic polling refreshes only
+  themselves (`test_own_polling_does_not_keep_opponent_connected`), and
+  each status poll overwrites the caller's `player_last_seen` with the
+  exact current timestamp — including on completed matches, where
+  heartbeats are still recorded.
+- **Give-ups are score- and ELO-neutral, always**: single give-ups,
+  ties, and even four tie rounds in a row leave the match 0-0/active;
+  a spy on `users_collection.update_one` confirms the give-up path never
+  writes ELO or W/L in ranked matches. Combined with bug "no points for
+  a stale-opponent tie" (presence suite) this means give-ups can stall
+  but never finish a match.
+- **Repeated give-up is idempotent** — the same `gave_up`/waiting body
+  every time, the opponent's flag untouched; the opponent's single
+  give-up (or the giver's retry once the opponent goes stale) still
+  resolves the tie.
+- **Ranked and friend give-up behavior is byte-identical** (single and
+  tie responses compared across match types), and a connected human
+  ranked opponent is never auto-mirrored by the bot branch (that
+  requires the literal `"bot-opponent"` sentinel).
+- **Both players stale, one gives up**: the caller's own staleness
+  self-heals (the request marks them seen before the presence check), so
+  only the opponent's staleness matters and the give-up auto-ties;
+  the opponent's stale timestamp is left untouched.
+- **Outsider hygiene**: 403 on status and give-up for active, completed
+  and waiting matches, with no presence-map or round-doc pollution from
+  the rejected calls. One latent quirk pinned as current behavior: the
+  waiting-match membership check compares against `str(None) == "None"`,
+  so an identity whose `_id` stringifies to `"None"` would be admitted
+  to any waiting friend match
+  (`test_current_behavior_identity_named_none_passes_waiting_membership`)
+  — unreachable via HTTP today (guest ids always start with `"guest-"`,
+  JWT ids are ObjectIds), so documented rather than xfailed.
+- **While searching there is nothing to poll**: a queued player has no
+  match id, guessing the next counter id 404s, `/api/game/active` says
+  no match, and the searcher is a plain 403 outsider on other pairs'
+  matches.
+
+### How to run
+
+```bash
+# Give-up & status-polling suite only (56 tests: 54 pass, 2 xfail)
+python3 -m pytest tests/test_match_giveup_status_edge_cases.py -q
+
+# Full repository suite (900 tests: 863 pass, 37 xfail)
+python3 -m pytest tests/ -q
+```
+
+Both xfails are `strict` with current-behavior sibling pins, matching the
+campaign convention.
