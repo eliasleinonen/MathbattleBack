@@ -140,6 +140,15 @@ def is_player_connected(match: dict, player_id) -> bool:
         return True
     return (utc_now() - ensure_utc(last_seen)).total_seconds() <= PRESENCE_TIMEOUT_SECONDS
 
+
+def _require_active_match(match: dict) -> None:
+    """Gameplay routes only make sense for active matches (not waiting/pending/abandoned/completed)."""
+    status = match.get("status")
+    if status == "completed":
+        raise HTTPException(status_code=400, detail="Match is already completed")
+    if status != "active":
+        raise HTTPException(status_code=400, detail="Match is not active")
+
 # Pre-generate 100 daily challenges
 def initialize_daily_challenges():
     """Pre-generate daily challenges for the next 100 days"""
@@ -1186,8 +1195,12 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
     user_id = str(current_user["_id"])  # Convert to string for consistent comparison
     user_elo = current_user["elo"]
     
-    # Check if user has a recently created active match (created in last 5 seconds by another player joining)
+    # Check if user has a recently created active match (created in last 5 seconds by another player joining).
+    # Only matchmaking matches (ranked/random) are considered: friend matches
+    # must never be hijacked as a ranked result or abandoned by ranked queueing.
     for match_id, match in in_memory_matches.items():
+        if match.get("match_type") not in ("ranked", "random"):
+            continue
         if match.get("status") == "active" and (str(match["player1_id"]) == user_id or str(match["player2_id"]) == user_id):
             # If match is very recent (less than 5 seconds old), it's a new match from matchmaking
             match_age = (datetime.utcnow() - match.get("created_at", datetime.utcnow())).total_seconds()
@@ -1208,6 +1221,10 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
                 # Old match from previous session, mark as abandoned
                 if not match_data.continue_existing:
                     match["status"] = "abandoned"
+                    await matches_collection.update_one(
+                        {"_id": match_id},
+                        {"$set": {"status": "abandoned", "updated_at": datetime.utcnow()}}
+                    )
     
     # Try to find any opponent from the queue (no ELO restriction)
     opponent_id = None
@@ -1495,9 +1512,7 @@ async def get_question(match_id: str, current_user = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Not your match")
     mark_player_seen(match, user_id)
 
-    # Check if match is already completed
-    if match.get("status") == "completed":
-        raise HTTPException(status_code=400, detail="Match is already completed")
+    _require_active_match(match)
 
     # Serialize round lookup/creation per match: after a round ends, both
     # clients request the next question at nearly the same time. Without the
@@ -1648,6 +1663,8 @@ async def _give_up_round_locked(match_id: str, current_user):
         raise HTTPException(status_code=403, detail="Not your match")
     mark_player_seen(match, user_id)
 
+    _require_active_match(match)
+
     round_id = match.get("current_round_id")
     if not round_id:
         raise HTTPException(status_code=404, detail="No active round")
@@ -1758,9 +1775,7 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
         raise HTTPException(status_code=403, detail="Not your match")
     mark_player_seen(match, user_id)
 
-    # Check if match is already completed - prevent processing answers after match ends
-    if match.get("status") == "completed":
-        raise HTTPException(status_code=400, detail="Match is already completed")
+    _require_active_match(match)
     
     # Get current round from match
     round_id = match.get("current_round_id")
