@@ -1870,3 +1870,135 @@ python3 -m pytest tests/ -q
 
 Both xfails are `strict` with current-behavior sibling pins, matching the
 campaign convention.
+
+## Reconnect window & abandonment deep-dive (`/api/game/start`, `tests/test_match_reconnect_abandon_edge_cases.py`)
+
+35 tests (34 pass, 1 strict `xfail`). A dedicated pass over the 5-second
+reconnect window in `start_match` and every abandonment interaction it
+has with people matches, going deeper than the boundary/lifecycle
+coverage already in the ranked, presence, isolation, cancel and datetime
+suites. Exact window ages are pinned to the microsecond with a frozen
+clock (a `datetime` subclass monkeypatched over `main.datetime`, so the
+naive `utcnow()` subtraction is deterministic). With this file the full
+repository suite collects **935 tests** and runs as **897 passed, 38
+xfailed**.
+
+### New bug
+
+35. **P1 — Abandonment is a memory-only mutation; Mongo keeps `active`
+    and evicted abandoned matches resurrect**
+    (xfail `test_abandonment_should_survive_memory_eviction`).
+    The stale-match scan in `start_match` marks a >5s-old match abandoned
+    by assigning `match["status"] = "abandoned"` on the in-memory doc —
+    no `matches_collection.update_one` ever follows (verified with a spy:
+    zero writes touch the abandoned match). The persisted doc stays
+    `active` forever, so after a memory eviction / restart / worker
+    switch, the hydrate paths (`status`, `question`, `answer`,
+    `give-up`) reload the stale doc and the supposedly-dead match
+    **resurrects as active for both players**, reappearing in
+    `/api/game/active`. Combined with bug 8 (abandoned zombies remain
+    playable) this makes abandonment cosmetic twice over: it neither
+    stops play before an eviction nor survives one. Same
+    never-persisted-mutation family as presence (`player_last_seen`)
+    and the give-up flag findings (bugs 28/34). Pinned by
+    `test_current_behavior_abandonment_never_written_to_db` (spy +
+    fake DB doc still `active`) and
+    `test_current_behavior_evicted_abandoned_match_resurrects_as_active`
+    (status poll answers `active` post-eviction and `/api/game/active`
+    advertises the match again).
+
+    *Fix:* persist the transition where it happens — in the scan's
+    abandon branch, `await matches_collection.update_one({"_id":
+    match_id}, {"$set": {"status": "abandoned", "updated_at": ...}})`
+    alongside the in-memory write (and consider batching if a caller can
+    abandon several matches in one poll, see below).
+
+### Window boundary (frozen clock, exact ages)
+
+- The window is **strictly `match_age < 5`**: ages 0.000s and 4.999s
+  reconnect; exactly 5.000s and 5.001s abandon the match and put the
+  caller back in the queue. The boundary instant itself is already
+  outside the window.
+- A **future `created_at`** (clock skew) yields a negative age, which is
+  `< 5` — the match is treated as brand new and reconnected, however far
+  in the future the timestamp is.
+
+### Multiple active matches: which one reconnects
+
+- The scan iterates `in_memory_matches` in **insertion order** and
+  returns on the first active `<5s` match involving the caller — the
+  earliest-inserted match wins; later matches are never even looked at.
+- One `/start` call can do **both jobs at once**: it abandons a stale
+  first match as it walks past it, then reconnects into a still-recent
+  second one.
+- **Early-return quirk**: if the first match is recent and a LATER match
+  is stale, the scan returns before reaching the stale one, which
+  silently stays active — the user keeps two live matches.
+- With **no recent match**, the scan walks the whole dict and abandons
+  every stale active match the caller is part of in a single poll.
+
+### continue_existing × friend/ranked matrix (8 combinations pinned)
+
+- **Stale (>5s) matches**: `/start` always answers `"searching"`
+  regardless of the flag; `continue_existing=True` never returns the old
+  match (the quirk already documented in the ranked suite), it only
+  decides whether the old match is abandoned (`False`) or silently left
+  active (`True`). Identical for ranked and friend matches — the friend
+  rows re-pin the `match_type`-blind scan (bug 7) from a new angle.
+- **Recent (<5s) matches**: the reconnect branch fires **before**
+  `continue_existing` is consulted, so both flag values reconnect —
+  including the bug-7 hijack flavor where a ranked `/start` "reconnects"
+  into a fresh friend match.
+
+### Mid-round reconnects and terminal statuses
+
+- **Reconnecting while the opponent is mid-round is lossless**: the
+  round doc, `current_round_id` and the shared `round_start_time`
+  countdown anchor all survive the `/start` poll, the opponent's
+  in-flight answer still wins the round, and the reconnector can equally
+  steal the open round with their own answer — reconnection neither
+  resets nor forfeits the round.
+- **Completed matches** are never reconnected (even <5s old) and never
+  abandoned (the abandon branch only runs for `active`, so a >5s-old
+  completed match keeps its terminal status); re-queueing pairs a fresh
+  match with a fresh id and code.
+- **Abandoned matches** are likewise skipped even inside the window; the
+  search continues, and the same pair re-matches into a fresh match
+  while the old one stays dead.
+
+### Both players reconnecting
+
+- Both players' `/start` polls (including interleaved A/B/A/B/A
+  sequences, and both at the exact 4.999s boundary under the frozen
+  clock) land in the **same** match — no duplicate matches, no
+  re-queueing, queue empty throughout.
+
+### ISO-string / missing created_at (beyond the existing datetime-suite pins)
+
+- The **ISO-string `created_at` TypeError 500** (already pinned as the
+  naive-created-at bug family in the datetime suite) has a precise blast
+  radius: only the corrupted ACTIVE match's own two participants 500 —
+  an outsider's matchmaking is untouched, and the same corrupted
+  timestamp on a non-active (abandoned) match is harmless because the
+  status check precedes the age math. `continue_existing=True` cannot
+  dodge the 500 either: the subtraction happens before the flag is read.
+- **Missing `created_at` is a permanent trap**: `match.get("created_at",
+  datetime.utcnow())` re-defaults to the current time on EVERY scan, so
+  the match is forever "0s old" — repeated `/start` polls (with
+  `continue_existing=False`) always reconnect and the abandonment branch
+  can never fire; the player cannot re-enter the queue until the match
+  leaves `active` status (e.g. completion), at which point the scan
+  skips it and searching resumes.
+
+### How to run
+
+```bash
+# Reconnect/abandonment suite only (35 tests: 34 pass, 1 xfail)
+python3 -m pytest tests/test_match_reconnect_abandon_edge_cases.py -q
+
+# Full repository suite (935 tests: 897 pass, 38 xfail)
+python3 -m pytest tests/ -q
+```
+
+The xfail is `strict` with two current-behavior sibling pins (DB-write
+spy and post-eviction resurrection), matching the campaign convention.
