@@ -30,6 +30,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 MONGODB_URL = os.getenv("DATABASE_URL", "mongodb://localhost:27017")
 DATABASE_NAME = "derivative_duel"
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://mathbattle.xyz")
 # Google OAuth: sign-in and daily challenges require this to be set in the environment.
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
@@ -1029,8 +1030,8 @@ async def create_friend_match(data: FriendMatchCreate, current_user = Depends(ge
     except Exception as e:
         logger.warning("MongoDB insert_one failed: %s", e)
     
-    # Generate shareable link
-    link = f"http://localhost:3000/play/friend/{match_code}"
+    # Generate shareable link (uses FRONTEND_URL env var, defaults to production)
+    link = f"{FRONTEND_URL}/game/{match_code}"
     
     return {
         "match_id": match_id,
