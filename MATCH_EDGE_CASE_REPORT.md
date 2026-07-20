@@ -28,9 +28,8 @@ throughout.
 
 ### Test inventory
 
-23 dedicated edge-case suites, **1084 edge-case tests collected**
-(verified with `pytest --collect-only -q`). Full repository suite:
-**1120 collected → 1061 passed, 59 xfailed**.
+23 dedicated edge-case suites, **1084 edge-case tests collected**.
+Full repository suite: **1120 collected → 1061 passed, 59 xfailed**.
 Every xfail is strict and pins a real bug documented below.
 
 | File | Tests | xfail markers |
@@ -55,13 +54,12 @@ Every xfail is strict and pins a real bug documented below.
 | `tests/test_match_presence_and_lifecycle_edge_cases.py` | 68 | 1 |
 | `tests/test_match_question_and_round_edge_cases.py` | 68 | 2 |
 | `tests/test_match_reconnect_abandon_edge_cases.py` | 35 | 1 |
-| `tests/test_match_status_gate_edge_cases.py` | 58 | 10 |
+| `tests/test_match_status_gate_edge_cases.py` | 58 | 3 |
 | `tests/test_match_win_completion_edge_cases.py` | 33 | 1 |
 | `tests/test_ranked_matchmaking_edge_cases.py` | 44 | 2 |
-| **Edge-case total** | **1084** | **59** |
+| **Edge-case total** | **1084** | **52** |
 
-The full repository suite (including pre-existing tests) collects
-1120 tests and runs as 1061 passed, 59 xfailed.
+The full repository suite collects 1120 tests and runs as 1061 passed, 59 xfailed.
 
 ### Severity-ranked bug list
 
