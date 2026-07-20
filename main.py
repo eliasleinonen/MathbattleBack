@@ -981,17 +981,25 @@ async def create_friend_match(data: FriendMatchCreate, current_user = Depends(ge
     match_code = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))
     
     # Ensure match code is unique
-    while await matches_collection.find_one({"match_code": match_code}):
-        match_code = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))
+    try:
+        while await matches_collection.find_one({"match_code": match_code}):
+            match_code = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))
+    except Exception as e:
+        logger.warning("MongoDB lookup failed during code check: %s", e)
+        while any(m.get("match_code") == match_code for m in in_memory_matches.values()):
+            match_code = ''.join(random.choices('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6))
     
     # If opponent username is provided, look them up
     opponent_id = None
     opponent_elo = 1000
     if data.opponent_username:
-        opponent = await users_collection.find_one({"username": data.opponent_username})
-        if opponent:
-            opponent_id = opponent["_id"]
-            opponent_elo = opponent.get("elo", 1000)
+        try:
+            opponent = await users_collection.find_one({"username": data.opponent_username})
+            if opponent:
+                opponent_id = opponent["_id"]
+                opponent_elo = opponent.get("elo", 1000)
+        except Exception as e:
+            logger.warning("MongoDB lookup failed for opponent: %s", e)
     
     # Create match with timestamp-based unique ID
     match_id = new_match_id()
@@ -1014,9 +1022,12 @@ async def create_friend_match(data: FriendMatchCreate, current_user = Depends(ge
         "created_at": datetime.utcnow()
     }
     
-    # Store in both memory and database
+    # Store in memory
     in_memory_matches[match_id] = match_doc
-    await matches_collection.insert_one(match_doc.copy())
+    try:
+        await matches_collection.insert_one(match_doc.copy())
+    except Exception as e:
+        logger.warning("MongoDB insert_one failed: %s", e)
     
     # Generate shareable link
     link = f"http://localhost:3000/play/friend/{match_code}"
@@ -1032,16 +1043,22 @@ async def create_friend_match(data: FriendMatchCreate, current_user = Depends(ge
 @app.post("/api/game/friend/join")
 async def join_friend_match(data: FriendMatchJoin, current_user = Depends(get_current_user)):
     """Join a friend match using a match code"""
-    # Find match by code in database first
-    match = await matches_collection.find_one({"match_code": data.match_code.upper()})
-    
+    code = data.match_code.strip().upper()
+    match = None
+
+    try:
+        match = await matches_collection.find_one({"match_code": code})
+        if not match and code != data.match_code.strip():
+            match = await matches_collection.find_one({"match_code": data.match_code.strip()})
+    except Exception as e:
+        logger.warning("MongoDB find_one failed in join_friend_match: %s", e)
+
     if not match:
-        # Try in-memory matches as fallback
         for mid, m in in_memory_matches.items():
-            if m.get("match_code") == data.match_code.upper():
+            if m.get("match_code") in (code, data.match_code.strip()):
                 match = m
                 break
-    
+
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
     
@@ -1051,7 +1068,10 @@ async def join_friend_match(data: FriendMatchJoin, current_user = Depends(get_cu
     async with get_match_lock(match_id):
         locked = in_memory_matches.get(match_id)
         if locked is None:
-            locked = await matches_collection.find_one({"_id": match_id})
+            try:
+                locked = await matches_collection.find_one({"_id": match_id})
+            except Exception as e:
+                logger.warning("MongoDB find_one failed under lock: %s", e)
             if locked is None:
                 locked = match
             in_memory_matches[match_id] = locked
@@ -1060,7 +1080,7 @@ async def join_friend_match(data: FriendMatchJoin, current_user = Depends(get_cu
         if match["status"] != "waiting":
             raise HTTPException(status_code=400, detail="Match already started")
 
-        if match["player1_id"] == current_user["_id"]:
+        if str(match["player1_id"]) == str(current_user["_id"]):
             raise HTTPException(status_code=400, detail="Cannot join your own match")
 
         # Join as player 2
@@ -1069,14 +1089,17 @@ async def join_friend_match(data: FriendMatchJoin, current_user = Depends(get_cu
         match["status"] = "active"
         in_memory_matches[match_id] = match
 
-        await matches_collection.update_one(
-            {"_id": match_id},
-            {"$set": {
-                "player2_id": current_user["_id"],
-                "player2_elo": current_user["elo"],
-                "status": "active"
-            }}
-        )
+        try:
+            await matches_collection.update_one(
+                {"_id": match_id},
+                {"$set": {
+                    "player2_id": current_user["_id"],
+                    "player2_elo": current_user["elo"],
+                    "status": "active"
+                }}
+            )
+        except Exception as e:
+            logger.warning("MongoDB update_one failed in join_friend_match: %s", e)
 
         return {
             "match_id": match_id,
@@ -1087,16 +1110,22 @@ async def join_friend_match(data: FriendMatchJoin, current_user = Depends(get_cu
 @app.get("/api/game/friend/status/{match_code}")
 async def get_match_status(match_code: str):
     """Check if a friend match is ready (doesn't require auth)"""
-    # Find match by code in database
-    match = await matches_collection.find_one({"match_code": match_code.upper()})
-    
+    code = match_code.strip().upper()
+    match = None
+
+    try:
+        match = await matches_collection.find_one({"match_code": code})
+        if not match and code != match_code.strip():
+            match = await matches_collection.find_one({"match_code": match_code.strip()})
+    except Exception as e:
+        logger.warning("MongoDB find_one failed in get_match_status: %s", e)
+
     if not match:
-        # Try in-memory matches as fallback
         for mid, m in in_memory_matches.items():
-            if m.get("match_code") == match_code.upper():
+            if m.get("match_code") in (code, match_code.strip()):
                 match = m
                 break
-    
+
     if not match:
         raise HTTPException(status_code=404, detail="Match not found")
     
@@ -1532,11 +1561,16 @@ async def get_question(match_id: str, current_user = Depends(get_current_user)):
 
     if not match:
         # Try to load from database
-        match = await matches_collection.find_one({"_id": match_id})
-        if match:
-            in_memory_matches[match_id] = match
-        else:
-            raise HTTPException(status_code=404, detail="Match not found")
+        try:
+            match = await matches_collection.find_one({"_id": match_id})
+            if match:
+                in_memory_matches[match_id] = match
+        except Exception as e:
+            logger.warning("MongoDB find_one failed in get_question: %s", e)
+
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+
     user_id = str(current_user["_id"])
     if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
         raise HTTPException(status_code=403, detail="Not your match")
@@ -1570,14 +1604,17 @@ async def get_question(match_id: str, current_user = Depends(get_current_user)):
                 # Timed out - mark round as tie, then fall through to create a new one
                 round_doc["winner_id"] = "tie"
                 in_memory_rounds[current_round_id] = round_doc
-                await rounds_collection.update_one(
-                    {"_id": current_round_id},
-                    {"$set": {"winner_id": "tie"}}
-                )
-                await matches_collection.update_one(
-                    {"_id": match_id, "rounds.round_number": round_doc["round_number"]},
-                    {"$set": {"rounds.$.winner": "tie"}}
-                )
+                try:
+                    await rounds_collection.update_one(
+                        {"_id": current_round_id},
+                        {"$set": {"winner_id": "tie"}}
+                    )
+                    await matches_collection.update_one(
+                        {"_id": match_id, "rounds.round_number": round_doc["round_number"]},
+                        {"$set": {"rounds.$.winner": "tie"}}
+                    )
+                except Exception as e:
+                    logger.warning("MongoDB update failed on round timeout: %s", e)
 
         return await _create_next_round(match_id, match)
 
@@ -1639,9 +1676,12 @@ async def _create_next_round(match_id: str, match: dict) -> dict:
     in_memory_rounds[round_id] = round_doc
     
     # Check if round already exists in database before inserting
-    existing_round = await rounds_collection.find_one({"_id": round_id})
-    if not existing_round:
-        await rounds_collection.insert_one(round_doc.copy())
+    try:
+        existing_round = await rounds_collection.find_one({"_id": round_id})
+        if not existing_round:
+            await rounds_collection.insert_one(round_doc.copy())
+    except Exception as e:
+        logger.warning("MongoDB round insert failed in _create_next_round: %s", e)
     
     # Store current round ID in match and add round to rounds array
     in_memory_matches[match_id]["current_round_id"] = round_id
@@ -1659,13 +1699,16 @@ async def _create_next_round(match_id: str, match: dict) -> dict:
         "player2_answer": None
     }
     
-    await matches_collection.update_one(
-        {"_id": match_id},
-        {
-            "$set": {"current_round_id": round_id, "round_start_time": round_start_time.isoformat(), "updated_at": datetime.utcnow()},
-            "$push": {"rounds": round_summary}
-        }
-    )
+    try:
+        await matches_collection.update_one(
+            {"_id": match_id},
+            {
+                "$set": {"current_round_id": round_id, "round_start_time": round_start_time.isoformat(), "updated_at": datetime.utcnow()},
+                "$push": {"rounds": round_summary}
+            }
+        )
+    except Exception as e:
+        logger.warning("MongoDB match update failed in _create_next_round: %s", e)
     
     return _question_response(round_id, round_doc, round_start_time.isoformat())
 
@@ -1701,7 +1744,11 @@ async def _give_up_round_locked(match_id: str, current_user):
     
     round_doc = in_memory_rounds.get(round_id)
     if not round_doc:
-        loaded = await rounds_collection.find_one({"_id": round_id})
+        try:
+            loaded = await rounds_collection.find_one({"_id": round_id})
+        except Exception as e:
+            logger.warning("MongoDB find_one failed in give_up: %s", e)
+            loaded = None
         # Prefer any in-memory copy written while we awaited the DB.
         round_doc = in_memory_rounds.get(round_id)
         if round_doc is None:
@@ -1725,10 +1772,13 @@ async def _give_up_round_locked(match_id: str, current_user):
     in_memory_rounds[round_id] = round_doc
     
     # Update in database
-    await rounds_collection.update_one(
-        {"_id": round_id},
-        {"$set": {give_up_field: True}}
-    )
+    try:
+        await rounds_collection.update_one(
+            {"_id": round_id},
+            {"$set": {give_up_field: True}}
+        )
+    except Exception as e:
+        logger.warning("MongoDB update_one failed in give_up: %s", e)
     
     # Check if this is a bot match - bot automatically gives up too
     is_bot_match = match.get("match_type") == "random" and match["player2_id"] == "bot-opponent"
@@ -1744,10 +1794,13 @@ async def _give_up_round_locked(match_id: str, current_user):
         round_doc["player2_gave_up"] = True
         in_memory_rounds[round_id] = round_doc
         
-        await rounds_collection.update_one(
-            {"_id": round_id},
-            {"$set": {"player1_gave_up": True, "player2_gave_up": True}}
-        )
+        try:
+            await rounds_collection.update_one(
+                {"_id": round_id},
+                {"$set": {"player1_gave_up": True, "player2_gave_up": True}}
+            )
+        except Exception as e:
+            logger.warning("MongoDB update_one failed in give_up: %s", e)
     
     # Check if both players gave up
     if round_doc.get("player1_gave_up") and round_doc.get("player2_gave_up"):
@@ -1755,16 +1808,19 @@ async def _give_up_round_locked(match_id: str, current_user):
         round_doc["winner_id"] = "tie"
         in_memory_rounds[round_id] = round_doc
         
-        await rounds_collection.update_one(
-            {"_id": round_id},
-            {"$set": {"winner_id": "tie"}}
-        )
-        
-        # Update match rounds array
-        await matches_collection.update_one(
-            {"_id": match_id, "rounds.round_number": round_doc["round_number"]},
-            {"$set": {"rounds.$.winner": "tie", "updated_at": datetime.utcnow()}}
-        )
+        try:
+            await rounds_collection.update_one(
+                {"_id": round_id},
+                {"$set": {"winner_id": "tie"}}
+            )
+            
+            # Update match rounds array
+            await matches_collection.update_one(
+                {"_id": match_id, "rounds.round_number": round_doc["round_number"]},
+                {"$set": {"rounds.$.winner": "tie", "updated_at": datetime.utcnow()}}
+            )
+        except Exception as e:
+            logger.warning("MongoDB update_one failed in give_up tie: %s", e)
         
         return {
             "status": "both_gave_up",
@@ -1789,16 +1845,17 @@ async def submit_answer(data: AnswerSubmit, current_user = Depends(get_current_u
 async def _submit_answer_locked(data: AnswerSubmit, current_user):
     match = in_memory_matches.get(data.match_id)
 
-    
-
     if not match:
         # Try to find in database
-        match = await matches_collection.find_one({"_id": data.match_id})
-        if match:
-            # Load match back into memory
-            in_memory_matches[data.match_id] = match
-        else:
-            raise HTTPException(status_code=404, detail="Match not found")
+        try:
+            match = await matches_collection.find_one({"_id": data.match_id})
+            if match:
+                in_memory_matches[data.match_id] = match
+        except Exception as e:
+            logger.warning("MongoDB find_one failed in submit_answer: %s", e)
+
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
     
     user_id = str(current_user["_id"])
     if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
@@ -1815,7 +1872,11 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
     # Try to get round from memory, otherwise load from database
     round_doc = in_memory_rounds.get(round_id)
     if not round_doc:
-        loaded = await rounds_collection.find_one({"_id": round_id})
+        try:
+            loaded = await rounds_collection.find_one({"_id": round_id})
+        except Exception as e:
+            logger.warning("MongoDB find_one failed in submit_answer: %s", e)
+            loaded = None
         # Prefer any in-memory copy written while we awaited the DB.
         round_doc = in_memory_rounds.get(round_id)
         if round_doc is None:
@@ -1850,42 +1911,52 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
         if elapsed_time > round_doc["time_limit"]:
             # Bot wins
             in_memory_rounds[round_id]["winner_id"] = match["player2_id"]
-            await rounds_collection.update_one(
-                {"_id": round_id},
-                {"$set": {"winner_id": match["player2_id"]}}
-            )
+            try:
+                await rounds_collection.update_one(
+                    {"_id": round_id},
+                    {"$set": {"winner_id": match["player2_id"]}}
+                )
+            except Exception:
+                pass
             # Update match scores
             player2_score = match["player2_score"] + 1
             in_memory_matches[data.match_id]["player2_score"] = player2_score
-            await matches_collection.update_one(
-                {"_id": data.match_id, "rounds.round_number": round_doc["round_number"]},
-                {"$set": {
-                    "rounds.$.winner": "player2",
-                    "player2_score": player2_score,
-                    "updated_at": datetime.utcnow()
-                }}
-            )
+            try:
+                await matches_collection.update_one(
+                    {"_id": data.match_id, "rounds.round_number": round_doc["round_number"]},
+                    {"$set": {
+                        "rounds.$.winner": "player2",
+                        "player2_score": player2_score,
+                        "updated_at": datetime.utcnow()
+                    }}
+                )
+            except Exception:
+                pass
             # If match is over, update match status and ELO
             match_winner = None
             elo_change = 0
             if player2_score >= 3:
                 match_winner = match["player2_id"]
-                # Bot won the match - calculate ELO change for player1 (who lost)
                 elo_change = calculate_elo_change(match["player2_elo"], match["player1_elo"])
                 
-                # Update player1 ELO (loser)
-                await users_collection.update_one(
-                    {"_id": match["player1_id"]},
-                    {"$inc": {"elo": -elo_change, "losses": 1}}
-                )
+                try:
+                    await users_collection.update_one(
+                        {"_id": match["player1_id"]},
+                        {"$inc": {"elo": -elo_change, "losses": 1}}
+                    )
+                except Exception:
+                    pass
                 
                 in_memory_matches[data.match_id]["status"] = "completed"
                 in_memory_matches[data.match_id]["winner_id"] = match_winner
                 in_memory_matches[data.match_id]["elo_change"] = elo_change
-                await matches_collection.update_one(
-                    {"_id": data.match_id},
-                    {"$set": {"status": "completed", "winner_id": match_winner, "elo_change": elo_change, "updated_at": datetime.utcnow()}}
-                )
+                try:
+                    await matches_collection.update_one(
+                        {"_id": data.match_id},
+                        {"$set": {"status": "completed", "winner_id": match_winner, "elo_change": elo_change, "updated_at": datetime.utcnow()}}
+                    )
+                except Exception:
+                    pass
             response_data = {
                 "correct": False,
                 "already_won": True,
@@ -1896,7 +1967,6 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
                 "elo_change": elo_change,
                 "message": "Time limit exceeded"
             }
-            print(f"[DEBUG TIMEOUT] Bot wins round. Scores: {match['player1_score']}-{player2_score}, Match winner: {match_winner}, ELO change: {elo_change}")
             return response_data
     
     # Check answer - handle both derivative strings and numeric answers
@@ -1915,73 +1985,46 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
             from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application, function_exponentiation
             from sympy import trigsimp, expand, expand_trig, expand_log, logcombine, Pow, Function
             x = Symbol('x')
-            # Reject inputs that could hang sympy evaluation (e.g. 9**9**9 power
-            # towers) before any parsing; the except below grades them incorrect.
             if _answer_looks_unsafe(user_expr):
                 raise ValueError("answer rejected by grading safety guard")
             transformations = (standard_transformations + (implicit_multiplication_application, function_exponentiation))
-            # Parse unevaluated first so power towers are rejected before evaluation.
             if _parsed_answer_unsafe(parse_expr(user_expr, transformations=transformations, evaluate=False)):
                 raise ValueError("answer rejected by grading safety guard")
             user_sym = parse_expr(user_expr, transformations=transformations, evaluate=True)
             correct_sym = parse_expr(correct_expr, transformations=transformations, evaluate=True)
-            print(f"[DEBUG] user_expr: {user_expr}")
-            print(f"[DEBUG] correct_expr: {correct_expr}")
-            print(f"[DEBUG] user_sym: {user_sym}")
-            print(f"[DEBUG] correct_sym: {correct_sym}")
-            # Try direct simplify
             correct = simplify(user_sym - correct_sym) == 0
-            print(f"[DEBUG] simplify: {correct}")
             if not correct:
-                # Try expand
                 correct = simplify(expand(user_sym) - expand(correct_sym)) == 0
-                print(f"[DEBUG] expand: {correct}")
             if not correct:
-                # Try trigsimp
                 correct = simplify(trigsimp(user_sym) - trigsimp(correct_sym)) == 0
-                print(f"[DEBUG] trigsimp: {correct}")
             if not correct:
-                # Try logcombine
                 correct = simplify(logcombine(user_sym, force=True) - logcombine(correct_sym, force=True)) == 0
-                print(f"[DEBUG] logcombine: {correct}")
             if not correct:
-                # Try expand_log and expand_trig
                 user_expanded = expand_log(expand_trig(user_sym))
                 correct_expanded = expand_log(expand_trig(correct_sym))
                 correct = simplify(user_expanded - correct_expanded) == 0
-                print(f"[DEBUG] expand_log+expand_trig: {correct}")
             if not correct:
-                # Try SymPy's equals method
                 try:
                     correct = user_sym.equals(correct_sym)
-                    print(f"[DEBUG] equals: {correct}")
                 except Exception:
                     pass
             if not correct:
-                # Try reciprocal root equivalence: (1/2)*x**(-1/2) == 1/(2*sqrt(x))
                 try:
-                    # Only attempt if user_sym or correct_sym contains Pow with negative exponent
                     def try_root_equiv(expr1, expr2):
-                        # (1/2)*x**(-1/2) <-> 1/(2*sqrt(x))
                         from sympy import sqrt
                         expr1_alt = expr1.replace(lambda e: isinstance(e, Pow) and e.exp == -1/2, lambda e: 1/sqrt(e.base))
                         expr2_alt = expr2.replace(lambda e: isinstance(e, Pow) and e.exp == -1/2, lambda e: 1/sqrt(e.base))
                         return simplify(expr1 - expr2_alt) == 0 or simplify(expr1_alt - expr2) == 0 or simplify(expr1_alt - expr2_alt) == 0
                     correct = try_root_equiv(user_sym, correct_sym)
-                    print(f"[DEBUG] root equivalence: {correct}")
                 except Exception:
                     pass
             if not correct:
-                # Fallback: if both are the same function of x (e.g., cos(x)), accept
                 try:
                     if isinstance(user_sym, Function) and isinstance(correct_sym, Function):
                         correct = user_sym.func == correct_sym.func and user_sym.args == correct_sym.args
-                        print(f"[DEBUG] function fallback: {correct}")
                 except Exception:
                     pass
             if not correct:
-                # Numeric fallback: test at random points (for expressions in x only).
-                # Skipped for power-heavy trees whose substitution could hang.
                 try:
                     from sympy import N
                     if not (_expression_too_complex(user_sym) or _expression_too_complex(correct_sym)):
@@ -1993,41 +2036,37 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
                                 break
                         else:
                             correct = True
-                    print(f"[DEBUG] numeric fallback: {correct}")
                 except Exception:
                     pass
         except (SympifyError, Exception) as e:
-            print(f"SymPy error: {e}")
             correct = False
     else:
-        # This is a numeric question - compare with tolerance
         try:
             correct = abs(float(data.answer) - float(expected_answer)) < 0.1
         except (ValueError, TypeError):
             correct = False
     
-    # Determine if this is against bot
     is_player1 = str(current_user["_id"]) == str(match["player1_id"])
     is_bot_match = match.get("match_type") == "random" and match.get("player2_id") == "bot-opponent"
     
     # If incorrect, allow retry - don't end the round
     if not correct:
-        # Store the wrong answer but don't end round
         update_field = "player1_answer" if is_player1 else "player2_answer"
         in_memory_rounds[round_id][update_field] = data.answer
-        await rounds_collection.update_one(
-            {"_id": round_id},
-            {"$set": {update_field: data.answer}}
-        )
-        
-        # Also update match rounds array with the wrong answer
-        await matches_collection.update_one(
-            {"_id": data.match_id, "rounds.round_number": round_doc["round_number"]},
-            {"$set": {
-                f"rounds.$.{update_field}": data.answer,
-                "updated_at": datetime.utcnow()
-            }}
-        )
+        try:
+            await rounds_collection.update_one(
+                {"_id": round_id},
+                {"$set": {update_field: data.answer}}
+            )
+            await matches_collection.update_one(
+                {"_id": data.match_id, "rounds.round_number": round_doc["round_number"]},
+                {"$set": {
+                    f"rounds.$.{update_field}": data.answer,
+                    "updated_at": datetime.utcnow()
+                }}
+            )
+        except Exception as e:
+            logger.warning("MongoDB update failed on wrong answer: %s", e)
         
         return {
             "correct": False,
@@ -2042,13 +2081,8 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
     round_winner = None
     
     if is_bot_match:
-        # Simulate bot answer with calibrated difficulty
-        import time
         difficulty_factor = round_doc["difficulty"] * 0.25
         bot_correct = random.random() < (1 - difficulty_factor)
-
-        # Bot response time depends on user ELO: higher ELO = faster bot
-        # 600 ELO: 8-22s, 1600 ELO: 3-12s, 2000 ELO: 1.5-6s, interpolate piecewise
         user_elo = match["player1_elo"] if is_player1 else match["player2_elo"]
         if user_elo <= 1600:
             min_elo, max_elo = 600, 1600
@@ -2059,7 +2093,6 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
             bot_min = min_bot_min + (max_bot_min - min_bot_min) * t
             bot_max = min_bot_max + (max_bot_max - min_bot_max) * t
         else:
-            # 1600 to 2000: 3-12s to 1.5-6s
             min_elo, max_elo = 1600, 2000
             min_bot_min, min_bot_max = 3, 12
             max_bot_min, max_bot_max = 1.5, 6
@@ -2069,21 +2102,19 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
             bot_max = min_bot_max + (max_bot_max - min_bot_max) * t
         bot_time = random.uniform(bot_min, bot_max)
 
-        # For realism, store the time user took to answer (if not already present)
         now = utc_now()
-        if is_player1:
-            user_time_field = "player1_answer_time"
-        else:
-            user_time_field = "player2_answer_time"
+        user_time_field = "player1_answer_time" if is_player1 else "player2_answer_time"
         if user_time_field not in round_doc:
             round_doc[user_time_field] = now
             in_memory_rounds[round_id][user_time_field] = now
-            await rounds_collection.update_one(
-                {"_id": round_id},
-                {"$set": {user_time_field: now}}
-            )
+            try:
+                await rounds_collection.update_one(
+                    {"_id": round_id},
+                    {"$set": {user_time_field: now}}
+                )
+            except Exception:
+                pass
 
-        # Use synchronized round start time for fair bot timing
         round_start_raw = match.get("round_start_time") or round_doc.get("started_at") or round_doc.get("created_at")
         round_start = parse_round_start(round_start_raw) or now
         user_time = max(0.0, (now - round_start).total_seconds())
@@ -2104,13 +2135,16 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
     update_field = "player1_answer" if is_player1 else "player2_answer"
     in_memory_rounds[round_id][update_field] = data.answer
     
-    await rounds_collection.update_one(
-        {"_id": round_id},
-        {"$set": {
-            "winner_id": round_winner,
-            update_field: data.answer
-        }}
-    )
+    try:
+        await rounds_collection.update_one(
+            {"_id": round_id},
+            {"$set": {
+                "winner_id": round_winner,
+                update_field: data.answer
+            }}
+        )
+    except Exception as e:
+        logger.warning("MongoDB update_one failed for round winner: %s", e)
     
     # Update match scores
     player1_score = match["player1_score"]
@@ -2124,18 +2158,20 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
     in_memory_matches[data.match_id]["player1_score"] = player1_score
     in_memory_matches[data.match_id]["player2_score"] = player2_score
     
-    # Update match rounds array with winner and answers
     winner_name = "player1" if str(round_winner) == str(match["player1_id"]) else "player2" if str(round_winner) == str(match["player2_id"]) else "tie"
-    await matches_collection.update_one(
-        {"_id": data.match_id, "rounds.round_number": round_doc["round_number"]},
-        {"$set": {
-            "rounds.$.winner": winner_name,
-            f"rounds.$.{update_field}": data.answer,
-            "player1_score": player1_score,
-            "player2_score": player2_score,
-            "updated_at": datetime.utcnow()
-        }}
-    )
+    try:
+        await matches_collection.update_one(
+            {"_id": data.match_id, "rounds.round_number": round_doc["round_number"]},
+            {"$set": {
+                "rounds.$.winner": winner_name,
+                f"rounds.$.{update_field}": data.answer,
+                "player1_score": player1_score,
+                "player2_score": player2_score,
+                "updated_at": datetime.utcnow()
+            }}
+        )
+    except Exception as e:
+        logger.warning("MongoDB update_one failed for match rounds: %s", e)
     
     # Check if match is over
     match_winner = None
@@ -2146,42 +2182,42 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
         match_winner = match["player2_id"]
     
     if match_winner:
-        # Calculate ELO for ranked matches (human vs human) and bot matches
         if match.get("match_type") in ["random", "ranked"]:
             elo_change = calculate_elo_change(
                 match["player1_elo"] if match_winner == match["player1_id"] else match["player2_elo"],
                 match["player2_elo"] if match_winner == match["player1_id"] else match["player1_elo"]
             )
-            # Update both winner and loser ELOs
             winner_id = match["player1_id"] if match_winner == match["player1_id"] else match["player2_id"]
             loser_id = match["player2_id"] if match_winner == match["player1_id"] else match["player1_id"]
-            # Winner: +elo_change, +1 win
-            await users_collection.update_one(
-                {"_id": winner_id},
-                {"$inc": {"elo": elo_change, "wins": 1}}
-            )
-            # Loser: -elo_change, +1 loss (applies to both human and bot matches)
-            await users_collection.update_one(
-                {"_id": loser_id},
-                {"$inc": {"elo": -elo_change, "losses": 1}}
-            )
+            try:
+                await users_collection.update_one(
+                    {"_id": winner_id},
+                    {"$inc": {"elo": elo_change, "wins": 1}}
+                )
+                await users_collection.update_one(
+                    {"_id": loser_id},
+                    {"$inc": {"elo": -elo_change, "losses": 1}}
+                )
+            except Exception as e:
+                logger.warning("MongoDB user elo update failed: %s", e)
         
-        # Update match
         in_memory_matches[data.match_id]["status"] = "completed"
         in_memory_matches[data.match_id]["winner_id"] = match_winner
         in_memory_matches[data.match_id]["elo_change"] = elo_change
         in_memory_matches[data.match_id]["updated_at"] = datetime.utcnow()
         
-        # Update match in database
-        await matches_collection.update_one(
-            {"_id": data.match_id},
-            {"$set": {
-                "status": "completed",
-                "winner_id": match_winner,
-                "elo_change": elo_change,
-                "updated_at": datetime.utcnow()
-            }}
-        )
+        try:
+            await matches_collection.update_one(
+                {"_id": data.match_id},
+                {"$set": {
+                    "status": "completed",
+                    "winner_id": match_winner,
+                    "elo_change": elo_change,
+                    "updated_at": datetime.utcnow()
+                }}
+            )
+        except Exception as e:
+            logger.warning("MongoDB match complete update failed: %s", e)
     
     return {
         "correct": correct,
@@ -2198,24 +2234,23 @@ async def get_game_status(match_id: str, current_user = Depends(get_current_user
     """Get current game status for polling"""
     match = in_memory_matches.get(match_id)
     if not match:
-        # Try to find in database
-        match = await matches_collection.find_one({"_id": match_id})
-        if not match:
-            raise HTTPException(status_code=404, detail="Match not found")
-        # Cache so presence tracking below survives across polls
-        in_memory_matches[match_id] = match
+        try:
+            match = await matches_collection.find_one({"_id": match_id})
+            if match:
+                in_memory_matches[match_id] = match
+        except Exception as e:
+            logger.warning("MongoDB find_one failed in get_game_status: %s", e)
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
     
     user_id = str(current_user["_id"])
     if user_id not in (str(match["player1_id"]), str(match["player2_id"])):
         raise HTTPException(status_code=403, detail="Not your match")
 
-    # Presence: each poll is a heartbeat; the opponent is "connected" while
-    # their last heartbeat is recent enough.
     mark_player_seen(match, user_id)
     opponent_id = match["player2_id"] if user_id == str(match["player1_id"]) else match["player1_id"]
     opponent_connected = is_player_connected(match, opponent_id)
 
-    # Get current round info if exists
     current_round_id = match.get("current_round_id")
     round_winner = None
     player1_gave_up = False
@@ -2227,21 +2262,26 @@ async def get_game_status(match_id: str, current_user = Depends(get_current_user
         player1_gave_up = round_doc.get("player1_gave_up", False)
         player2_gave_up = round_doc.get("player2_gave_up", False)
     
-    # Get player usernames
-    player1 = await users_collection.find_one({"_id": match["player1_id"]})
-    
-    # Handle bot opponent
+    player1_name = match.get("player1_username", "Player 1")
+    player2_name = match.get("player2_username", "Player 2")
     if match["player2_id"] == "bot-opponent":
         player2_name = "AI Opponent"
     else:
-        player2 = await users_collection.find_one({"_id": match["player2_id"]})
-        player2_name = player2.get("username", "Player 2") if player2 else "Player 2"
+        try:
+            player1 = await users_collection.find_one({"_id": match["player1_id"]})
+            if player1 and ("username" in player1 or "name" in player1):
+                player1_name = player1.get("username", player1.get("name", "Player 1"))
+            player2 = await users_collection.find_one({"_id": match["player2_id"]})
+            if player2 and ("username" in player2 or "name" in player2):
+                player2_name = player2.get("username", player2.get("name", "Player 2"))
+        except Exception as e:
+            logger.warning("MongoDB user lookup failed in get_game_status: %s", e)
     
     return {
         "match_id": match_id,
         "player1_id": str(match["player1_id"]),
         "player2_id": str(match["player2_id"]),
-        "player1_name": player1.get("username", "Player 1") if player1 else "Player 1",
+        "player1_name": player1_name,
         "player2_name": player2_name,
         "player1_score": match["player1_score"],
         "player2_score": match["player2_score"],
