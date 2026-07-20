@@ -866,3 +866,188 @@ codes were made deterministic by stubbing `secrets.token_urlsafe`.
 - Both terminal states are served by `/api/game/status` (verbatim status,
   `winner_id` only for completed) and by `/api/game/match/{code}` for
   members; both are hidden from `/api/game/active` for all four players.
+
+## Bot fallback & bot round timing (`start_match` bot branch, `_create_next_round` time_limit, `submit_answer` timeout + simulation)
+
+Findings from `tests/test_bot_fallback_and_timeout_edge_cases.py` (28 tests:
+27 pass, 1 strict `xfail`). Timeouts were exercised by monkeypatching
+`main.utc_now` (frozen or offset clock) rather than backdating documents, so
+the exact comparison operators are pinned. Bot RNG (`random.random` for the
+dice roll, `random.uniform` for the response time, `random.randint` for the
+ELO offset, `random.choice` for the name) was patched per-test for
+deterministic races.
+
+### Bug (xfail test)
+
+1. **Stale cancel flag also eats the bot fallback** —
+   `test_requeued_user_should_get_bot_after_second_ten_second_wait` (xfail).
+   The known stale-cancel-flag bug has a second victim beyond human
+   pairings: a user who cancels, re-queues and then waits out the full 10s
+   is answered `{"status": "cancelled"}` by the bot-creation gate instead
+   of getting the bot match they were promised — and is silently dropped
+   from the queue on top. The full client-visible saga (cancel → re-queue →
+   bogus "cancelled" at the first deadline → re-queue again → bot only after
+   a *third* 10s wait) is pinned by
+   `test_current_behavior_cancel_then_requeue_saga_needs_three_waits`.
+
+### Bot match creation (asserted in passing tests)
+
+- After 10s in queue (strict `< 10`: exactly 10.0s already creates the bot;
+  9.5s still reports `searching` with `time_remaining: 0` via `int()`
+  truncation), the poll returns the standard matched shape and the match
+  doc is a normal counter-id/`token_urlsafe` document with
+  `match_type: "random"`, `player2_id: "bot-opponent"`, naive `created_at`,
+  and `player2_elo = player1_elo + randint(-150, -50)` (bounds spied;
+  unpatched sampling stays in range).
+- **The bot "user" object is discarded.** `start_match` builds a full bot
+  dict (email, roster name, wins/losses) and only the ELO survives into the
+  match. Consequently the same bot answers to **three different names**:
+  the roster name (e.g. `"Taylor (bot)"`, drawn via `random.choice` from a
+  fixed 7-name list) exists only in the one `start` response; `/status`
+  invents `"AI Opponent"`; `/match/{code}` invents `"Bot"`.
+- **Every bot branch is gated on the conjunction** `match_type == "random"`
+  **and** `player2_id == "bot-opponent"`. A friend match with the bot
+  sentinel forced into `player2_id` gets no time limit and no bot
+  simulation (instant human win); a `"random"`-type match with a human in
+  the player2 seat likewise behaves as a plain human match.
+- `is_opponent_bot` in `/match/{code}` uses `"bot" in str(opponent_id)`
+  instead of the sentinel: a human guest whose id merely contains "bot"
+  (`guest-abbot-1234`) is labeled a bot to their opponent
+  (`test_human_guest_with_bot_substring_in_id_is_mislabeled_as_bot`), while
+  all gameplay branches correctly treat them as human.
+
+### Bot round timing & timeouts
+
+- `time_limit` is recomputed from the **current** `player1_elo` for every
+  round (a mid-match ELO edit moves the next round's limit; finished rounds
+  keep theirs). Question difficulty, meanwhile, follows the *bot's* lower
+  ELO — two different ELOs feed one round.
+- The timeout check is strict `elapsed > time_limit` against the synced
+  `round_start_time`: landing exactly **on** the limit still gets the
+  answer graded. Past the limit the check runs *before* answer parsing, so
+  wrong and correct answers forfeit identically
+  (`"Time limit exceeded"`, `correct: false`, `already_won: true`).
+- Three timeout forfeits complete the match. With the offset pinned to
+  -100 (bot 900 vs 1000): losing to the bot costs **26** ELO, beating it
+  pays only **14** — the stake depends on who wins. The timeout completion
+  path writes **only the human loser** (`$inc {elo: -26, losses: 1}`; the
+  bot never gets a `wins` increment anywhere), while the answer-path win
+  writes **both** sides, including a `$inc` against the nonexistent
+  `"bot-opponent"` user document (a no-op in real Mongo).
+- Bot race semantics on a correct user answer: the dice roll happens only
+  inside the correct-answer branch (a wrong answer never triggers the bot —
+  the bot can only score via the time limit); bot-rolled-wrong or
+  bot-slower ⇒ user wins; bot faster ⇒ bot wins **while the response still
+  says `correct: true`** (the loss is only visible in
+  `round_winner`/`player2_score`); an exact time tie goes to the **bot**
+  (`user_time < bot_time` is strict); answering during the 3s countdown
+  clamps `user_time` to 0.0, which beats any positive bot time.
+- Presence/give-up: `"bot-opponent"` short-circuits to connected before any
+  bookkeeping (even a poisoned 30-day-old heartbeat is ignored), and a
+  single give-up in a bot match immediately resolves `both_gave_up`/tie
+  (the bot "gives up too") with no waiting limbo.
+- Human-first ordering holds even at scale: with three users all past the
+  10s deadline, the first poller pairs with a human (`ranked`) and only the
+  leftover third user falls back to a bot (`random`).
+
+## Cancel & queue lifecycle (`cancel_matchmaking`, queue state, `cancel_challenge` vs join races)
+
+Findings from `tests/test_match_cancel_and_queue_lifecycle_edge_cases.py`
+(25 tests: 21 pass, 4 strict `xfail`). Endpoint-level flows use guest
+tokens; race tests call the route coroutines directly under
+`asyncio.gather` with a laggy in-process matches DB (read snapshot, then
+yield) to force deterministic interleavings.
+
+### Bugs (xfail tests)
+
+1. **Stray cancel poisons a first-ever pairing** —
+   `test_cancel_before_ever_queueing_should_not_poison_first_pairing`
+   (xfail). `cancel_matchmaking` is a blind `pop` + `set.add` that never
+   checks queue membership, so a cancel from a user who was **never
+   queued** (UI misfire, stale tab) still plants the flag. Their very
+   first pairing afterwards is aborted: the opponent gets the bogus
+   `{"status": "cancelled"}` and both users are silently unqueued. Pinned
+   by `test_current_behavior_stray_cancel_aborts_first_pairing`.
+
+2. **The cancel flag survives an entire completed match** —
+   `test_late_cancel_flag_should_not_survive_a_completed_match` (xfail).
+   A cancel landing just after a match was created is never consumed: the
+   reconnect path ignores `cancelled_users`, playing the match doesn't
+   touch it, and completion doesn't either. The flag sits through the
+   whole game and then aborts the user's **next** pairing in a fresh
+   session. Every intermediate state is pinned by
+   `test_current_behavior_late_cancel_flag_survives_completed_match`.
+
+3. **`cancel_challenge` has no in-memory fallback** —
+   `test_memory_only_waiting_match_should_be_cancellable` (xfail). Like
+   the other challenge endpoints it reads only `matches_collection`, so a
+   waiting match that exists only in `in_memory_matches` (DB down/empty)
+   is fully **joinable** by code but 404s on cancel — the creator cannot
+   kill their own match. Pinned by
+   `test_current_behavior_memory_only_match_uncancellable_but_joinable`.
+
+4. **Racing `cancel_challenge` vs `join` lets both succeed** —
+   `test_racing_cancel_challenge_vs_join_must_not_both_succeed` (xfail).
+   Neither endpoint takes the per-match lock and both do check-then-act
+   around an awaited DB read. With any read latency, the join reads
+   `waiting`, the cancel reads `waiting`, the join activates the match and
+   returns 200 — and the cancel then deletes the *active* match from DB
+   **and** memory. The acknowledged joiner is left holding a match id that
+   404s on every subsequent request, as pinned by
+   `test_current_behavior_cancel_challenge_vs_join_race_deletes_joined_match`.
+   (Sequentially the guard works: join-then-cancel is 400.)
+
+### Cancel semantics & flag bookkeeping (asserted in passing tests)
+
+- Cancel is idempotent and unconditional: not-queued and double cancels
+  both return `{"status": "cancelled"}`; the set can't double-count; other
+  queued users are untouched.
+- Flags are consumed strictly **pairwise**: a pairing between other users
+  consumes nothing, and an aborted pairing consumes exactly the two ids it
+  popped. There is no global sweep.
+- **`cancelled_users` is an unbounded leak**: 40 distinct cancel-and-leave
+  users leave 40 permanent set entries that survive any amount of
+  unrelated matchmaking (no TTL, no cap; removal only ever happens via a
+  later pairing/bot attempt involving that user).
+
+### Queue lifecycle without polling
+
+- **Queue entries never expire on their own** — the 10s bot deadline is
+  only evaluated when the queued user polls. An hour-stale entry is still
+  present and still matchable.
+- A later arrival is paired against the hour-gone user into a **ghost
+  match** the absent player will never know about. Because the ghost never
+  polls, they have no `player_last_seen` entry and the never-seen rule
+  reports them **connected forever**: the live player can't get a give-up
+  auto-tie (`waiting_for_opponent: true`) and is stuck until the 5-minute
+  round timeout. Had the ghost polled even once, presence would flip to
+  disconnected 12s later and give-up would auto-tie as designed.
+
+### Abandon ↔ cancel interactions
+
+- Re-searching from a >5s-old match abandons it; a follow-up cancel
+  empties the queue and plants the flag but does not resurrect or complete
+  the abandoned match, and `/api/game/active` stays false for both.
+- Full round trip after mutual abandonment: both users cancel, both
+  re-queue — the first pairing attempt is eaten by the stale flags (as a
+  pair), and only the second attempt re-matches them.
+
+### `cancel_challenge` on waiting matches
+
+- With the DB reachable, cancelling a waiting (code-only) friend match
+  wipes it from DB **and** memory and kills the code on every surface
+  (join and the unauthenticated status poller both 404).
+- **Orphan leak**: because gameplay routes serve waiting matches, the
+  creator can fetch a question before anyone joins; cancel then deletes
+  only the match doc, leaving the round in `in_memory_rounds` and the lock
+  in `match_locks` forever.
+
+### Racing queue cancel vs pairing
+
+- The dangerous window (`await users_collection.find_one` between
+  selecting and popping an ObjectId opponent) is *safe* against cancels:
+  a cancel landing inside it makes the pairing consume the fresh flag and
+  return `{"status": "cancelled"}` to the joiner — spurious for them, but
+  no ghost match is created and all flags are consumed. A cancel landing
+  *before* the scan simply leaves the joiner searching, with the
+  canceller's flag lingering (feeding bugs 1/2).
