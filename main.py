@@ -1,5 +1,5 @@
 
-from sympy import sympify, simplify, Symbol, sqrt
+from sympy import sympify, simplify, Symbol, sqrt, Pow, count_ops
 from sympy.core.sympify import SympifyError
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +12,7 @@ from jose import JWTError, jwt
 import asyncio
 import logging
 import os
+import re
 import secrets
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
@@ -657,18 +658,105 @@ def calculate_elo_change(winner_elo: int, loser_elo: int) -> int:
     return max(1, change)
 
 
+# --- Answer grading safety guards -------------------------------------------
+# User answers are parsed with sympy's evaluate=True, so hostile inputs like
+# power towers (9**9**9) can hang the worker. These guards reject such inputs
+# cheaply, before any sympy parsing/evaluation happens.
+
+MAX_ANSWER_LENGTH = 200
+_MAX_POW_OPS = 8       # legitimate derivative answers use only a handful of powers
+_MAX_OPERATORS = 40
+_MAX_NUMERIC_EXPONENT = 100
+# Chained exponentiation with a simple operand in between, e.g. 9**9**9.
+_POW_TOWER_RE = re.compile(r"\*\*\s*[+-]?[\w.]+\s*\*\*")
+_HUGE_INT_RE = re.compile(r"\d{7,}")
+_LARGE_EXPONENT_RE = re.compile(r"\*\*\s*\(?\s*-?\s*\d{4,}")
+
+
+def normalize_answer_text(expr: str) -> str:
+    """Shared preprocessing: normalize unicode operators and ^ to Python syntax."""
+    s = str(expr).strip()
+    s = s.replace('·', '*').replace('×', '*').replace('∗', '*')
+    s = s.replace('^', '**')
+    return s
+
+
+def _answer_looks_unsafe(expr: str) -> bool:
+    """Cheap string-level check for inputs that could hang sympy evaluation."""
+    s = normalize_answer_text(expr)
+    if len(s) > MAX_ANSWER_LENGTH:
+        return True
+    if s.count('**') > _MAX_POW_OPS:
+        return True
+    if _POW_TOWER_RE.search(s):
+        return True
+    if _HUGE_INT_RE.search(s):
+        return True
+    if _LARGE_EXPONENT_RE.search(s):
+        return True
+    if sum(s.count(op) for op in '+-*/') > _MAX_OPERATORS:
+        return True
+    return False
+
+
+def _parsed_answer_unsafe(expr_sym) -> bool:
+    """Structural check on an unevaluated parse tree (parse_expr(..., evaluate=False)).
+
+    Catches power towers and huge exponents that the string heuristics can miss
+    (e.g. parenthesized towers like 9**((9**9))), before any evaluation happens.
+    """
+    try:
+        for p in expr_sym.atoms(Pow):
+            exp = p.exp
+            for inner in exp.atoms(Pow):
+                # Pow(Integer, -1) is just an unevaluated rational like 1/2.
+                if inner.exp == -1 and getattr(inner.base, "is_Integer", False):
+                    continue
+                return True
+            if exp.is_number:
+                try:
+                    if abs(float(exp)) > _MAX_NUMERIC_EXPONENT:
+                        return True
+                except (TypeError, ValueError, OverflowError):
+                    return True
+    except Exception:
+        return True
+    return False
+
+
+def _expression_too_complex(expr_sym) -> bool:
+    """Guard for the numeric fallback: skip substitution on power-heavy trees."""
+    try:
+        if len(expr_sym.atoms(Pow)) > _MAX_POW_OPS:
+            return True
+        if count_ops(expr_sym) > _MAX_OPERATORS:
+            return True
+    except Exception:
+        return True
+    return False
+
+
 def check_math_equivalence(correct_expr: str, user_expr: str) -> bool:
     """Check if two mathematical expressions are equivalent"""
     try:
         from sympy import trigsimp, expand, expand_trig, expand_log, logcombine, Pow, Function, sqrt
         from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application, function_exponentiation
         
-        # Replace unicode multiplication dot with * and ^ with **
-        correct_expr = correct_expr.replace('·', '*').replace('×', '*').replace('^', '**')
-        user_expr = user_expr.replace('·', '*').replace('×', '*').replace('^', '**')
+        # Replace unicode multiplication dot/cross with * and ^ with **
+        correct_expr = normalize_answer_text(correct_expr)
+        user_expr = normalize_answer_text(user_expr)
+        
+        # Reject inputs that could hang sympy before any parsing happens.
+        if _answer_looks_unsafe(user_expr):
+            print("[WARNING] Rejecting unsafe user expression in check_math_equivalence")
+            return False
         
         x = Symbol('x')
         transformations = (standard_transformations + (implicit_multiplication_application, function_exponentiation))
+        # Parse unevaluated first so power towers can be rejected before evaluation.
+        if _parsed_answer_unsafe(parse_expr(user_expr, transformations=transformations, evaluate=False)):
+            print("[WARNING] Rejecting unsafe user expression tree in check_math_equivalence")
+            return False
         user_sym = parse_expr(user_expr, transformations=transformations, evaluate=True)
         correct_sym = parse_expr(correct_expr, transformations=transformations, evaluate=True)
         
@@ -1746,9 +1834,7 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
     if isinstance(expected_answer, str):
         # Use SymPy to check for mathematical equivalence
         def preprocess(expr):
-            import re
-            s = str(expr).strip().replace("·", "*")
-            s = s.replace("^", "**")
+            s = normalize_answer_text(expr)
             s = re.sub(r'√([a-zA-Z0-9_]+)', r'sqrt(\1)', s)
             s = s.replace('ln(', 'log(')
             return s
@@ -1758,7 +1844,14 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
             from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application, function_exponentiation
             from sympy import trigsimp, expand, expand_trig, expand_log, logcombine, Pow, Function
             x = Symbol('x')
+            # Reject inputs that could hang sympy evaluation (e.g. 9**9**9 power
+            # towers) before any parsing; the except below grades them incorrect.
+            if _answer_looks_unsafe(user_expr):
+                raise ValueError("answer rejected by grading safety guard")
             transformations = (standard_transformations + (implicit_multiplication_application, function_exponentiation))
+            # Parse unevaluated first so power towers are rejected before evaluation.
+            if _parsed_answer_unsafe(parse_expr(user_expr, transformations=transformations, evaluate=False)):
+                raise ValueError("answer rejected by grading safety guard")
             user_sym = parse_expr(user_expr, transformations=transformations, evaluate=True)
             correct_sym = parse_expr(correct_expr, transformations=transformations, evaluate=True)
             print(f"[DEBUG] user_expr: {user_expr}")
@@ -1816,17 +1909,19 @@ async def _submit_answer_locked(data: AnswerSubmit, current_user):
                 except Exception:
                     pass
             if not correct:
-                # Numeric fallback: test at random points (for expressions in x only)
+                # Numeric fallback: test at random points (for expressions in x only).
+                # Skipped for power-heavy trees whose substitution could hang.
                 try:
                     from sympy import N
-                    for _ in range(5):
-                        val = random.uniform(1, 10)
-                        uval = N(user_sym.subs(x, val))
-                        cval = N(correct_sym.subs(x, val))
-                        if abs(uval - cval) > 1e-6:
-                            break
-                    else:
-                        correct = True
+                    if not (_expression_too_complex(user_sym) or _expression_too_complex(correct_sym)):
+                        for _ in range(5):
+                            val = random.uniform(1, 10)
+                            uval = N(user_sym.subs(x, val))
+                            cval = N(correct_sym.subs(x, val))
+                            if abs(uval - cval) > 1e-6:
+                                break
+                        else:
+                            correct = True
                     print(f"[DEBUG] numeric fallback: {correct}")
                 except Exception:
                     pass
