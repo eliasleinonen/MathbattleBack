@@ -20,6 +20,7 @@ import random
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from google.auth.exceptions import GoogleAuthError
+from passlib.hash import pbkdf2_sha256
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -215,6 +216,13 @@ class User(BaseModel):
     elo: int
     wins: int
     losses: int
+    is_guest: bool = False
+
+
+class UpgradeGuestRequest(BaseModel):
+    email: str
+    username: str
+    password: str
 
 
 class MatchStart(BaseModel):
@@ -237,6 +245,7 @@ class AnswerSubmit(BaseModel):
 
 class GoogleAuthRequest(BaseModel):
     token: str  # Google ID token
+    guest_id: Optional[str] = None
 
 
 class SetUsernameRequest(BaseModel):
@@ -264,36 +273,48 @@ def create_access_token(data: dict) -> str:
 
 async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     """
-    DEMO MODE: Always returns guest user for easy demo access.
-    Supports unique guest IDs via "Bearer guest-UUID" tokens.
+    Middleware to resolve authenticated user or guest.
+    Supports unique guest IDs via "Bearer guest-UUID" tokens and persists guest state in database.
     """
     # 1. Check for explicit guest token "Bearer guest-UUID"
     if credentials:
         token = credentials.credentials
         if token.startswith("guest-"):
-            # Use the provided guest ID
-            guest_id = token
-            return {
-                "_id": guest_id,
-                "email": f"{guest_id}@derivative-duel.com",
-                "name": f"Guest {guest_id[-4:]}",
-                "elo": 1000,
-                "wins": 0,
-                "losses": 0,
-                "created_at": datetime.utcnow()
-            }
+            if len(token) > 128 or not re.match(r"^guest-[a-zA-Z0-9_\-]+$", token):
+                return default_guest
+            guest = None
+            try:
+                guest = await users_collection.find_one({"_id": token})
+            except Exception as e:
+                logger.warning("MongoDB guest lookup failed: %s", e)
+            if not guest:
+                guest = {
+                    "_id": token,
+                    "email": f"{token}@derivative-duel.com",
+                    "name": f"Guest {token[-4:]}",
+                    "username": f"Guest_{token[-4:]}",
+                    "elo": 1000,
+                    "wins": 0,
+                    "losses": 0,
+                    "is_guest": True,
+                    "created_at": datetime.utcnow()
+                }
+                try:
+                    await users_collection.insert_one(guest)
+                except Exception as e:
+                    logger.warning("MongoDB guest insert failed: %s", e)
+            return guest
     
     # 2. Default fallback (if no token or standard JWT processing fails)
-    # We'll use a random ID here too if no token, 
-    # BUT this is risky as subsequent requests (get_question) need the SAME ID.
-    # For now, if no token, we return the generic one (browser should send guest token)
     default_guest = {
         "_id": "guest-user-id",
         "email": "guest@derivative-duel.com",
         "name": "Guest Player",
+        "username": "Guest_user-id",
         "elo": 1000,
         "wins": 0,
         "losses": 0,
+        "is_guest": True,
         "created_at": datetime.utcnow()
     }
     
@@ -304,18 +325,6 @@ async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] =
         # Try to decode JWT token
         token = credentials.credentials
         
-        # Double check it's not a guest token we missed
-        if token.startswith("guest-"):
-            return {
-                "_id": token,
-                "email": f"{token}@derivative-duel.com",
-                "name": f"Guest {token[-4:]}",
-                "elo": 1000,
-                "wins": 0,
-                "losses": 0,
-                "created_at": datetime.utcnow()
-            }
-            
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
         
@@ -915,22 +924,80 @@ async def google_auth(auth_request: GoogleAuthRequest):
 
     # Upsert: create the user on first sign-in, otherwise keep their existing record.
     user = None
+    guest = None
+    if auth_request.guest_id:
+        if (
+            isinstance(auth_request.guest_id, str)
+            and auth_request.guest_id.startswith("guest-")
+            and len(auth_request.guest_id) <= 128
+        ):
+            try:
+                found_doc = await users_collection.find_one({"_id": auth_request.guest_id})
+                if found_doc and found_doc.get("is_guest") is True:
+                    guest = found_doc
+                elif found_doc:
+                    logger.warning("Rejecting guest_id %s: Target account is not a guest", auth_request.guest_id)
+            except Exception as e:
+                logger.warning("MongoDB lookup for guest_id failed: %s", e)
+        else:
+            logger.warning("Rejecting guest_id: Invalid format %s", auth_request.guest_id)
+
     try:
         user = await users_collection.find_one({"email": email})
         if user is None:
-            new_user = {
-                "email": email,
-                "name": name,
-                "elo": 1000,
-                "wins": 0,
-                "losses": 0,
-                "created_at": datetime.now(timezone.utc),
-            }
-            res = await users_collection.insert_one(new_user.copy())
-            new_user["_id"] = res.inserted_id
-            user = new_user
+            if guest:
+                # Convert guest to new Google user
+                new_user = {
+                    "email": email,
+                    "name": name,
+                    "elo": guest.get("elo", 1000),
+                    "wins": guest.get("wins", 0),
+                    "losses": guest.get("losses", 0),
+                    "created_at": datetime.now(timezone.utc),
+                }
+                res = await users_collection.insert_one(new_user.copy())
+                new_user["_id"] = res.inserted_id
+                user = new_user
+                
+                # Clean up the guest
+                await users_collection.delete_one({"_id": auth_request.guest_id})
+                in_memory_users.pop(auth_request.guest_id, None)
+            else:
+                new_user = {
+                    "email": email,
+                    "name": name,
+                    "elo": 1000,
+                    "wins": 0,
+                    "losses": 0,
+                    "created_at": datetime.now(timezone.utc),
+                }
+                res = await users_collection.insert_one(new_user.copy())
+                new_user["_id"] = res.inserted_id
+                user = new_user
+        else:
+            if guest:
+                # Merge guest stats into existing Google user
+                new_elo = max(user.get("elo", 1000), guest.get("elo", 1000))
+                new_wins = user.get("wins", 0) + guest.get("wins", 0)
+                new_losses = user.get("losses", 0) + guest.get("losses", 0)
+                
+                await users_collection.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {
+                        "elo": new_elo,
+                        "wins": new_wins,
+                        "losses": new_losses
+                    }}
+                )
+                user["elo"] = new_elo
+                user["wins"] = new_wins
+                user["losses"] = new_losses
+                
+                # Clean up the guest
+                await users_collection.delete_one({"_id": auth_request.guest_id})
+                in_memory_users.pop(auth_request.guest_id, None)
     except Exception as e:
-        logger.warning("MongoDB user lookup/creation failed in google_auth: %s", e)
+        logger.warning("MongoDB user lookup/creation/merge failed in google_auth: %s", e)
 
     if user is None:
         user = {
@@ -960,8 +1027,93 @@ async def get_profile(current_user = Depends(get_current_user)):
         "username": current_user.get("username"),
         "elo": current_user["elo"],
         "wins": current_user["wins"],
-        "losses": current_user["losses"]
+        "losses": current_user["losses"],
+        "is_guest": current_user.get("is_guest", False)
     }
+
+
+@app.post("/api/user/upgrade-guest")
+async def upgrade_guest(request: UpgradeGuestRequest, current_user = Depends(get_current_user)):
+    if not current_user.get("is_guest", False):
+        raise HTTPException(
+            status_code=400,
+            detail="Only guest accounts can be upgraded"
+        )
+    
+    email = request.email.strip().lower()
+    username = request.username.strip()
+    password = request.password
+    
+    if not email or not username or not password:
+        raise HTTPException(
+            status_code=400,
+            detail="Email, username, and password are required"
+        )
+    
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid email address format"
+        )
+    
+    if len(username) < 3 or len(username) > 20:
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be between 3 and 20 characters"
+        )
+    
+    if len(password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 6 characters long"
+        )
+    
+    existing_email = await users_collection.find_one({
+        "email": email,
+        "_id": {"$ne": current_user["_id"]}
+    })
+    if existing_email:
+        raise HTTPException(
+            status_code=400,
+            detail="Email is already taken"
+        )
+    
+    existing_username = await users_collection.find_one({
+        "username": username,
+        "_id": {"$ne": current_user["_id"]}
+    })
+    if existing_username:
+        raise HTTPException(
+            status_code=400,
+            detail="Username is already taken"
+        )
+    
+    hashed_password = pbkdf2_sha256.hash(password)
+    
+    await users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {
+            "$set": {
+                "email": email,
+                "username": username,
+                "name": username,
+                "hashed_password": hashed_password,
+                "is_guest": False,
+                "updated_at": datetime.utcnow()
+            }
+        }
+    )
+    
+    current_user["email"] = email
+    current_user["username"] = username
+    current_user["name"] = username
+    current_user["hashed_password"] = hashed_password
+    current_user["is_guest"] = False
+    in_memory_users[email] = current_user
+    in_memory_users[str(current_user["_id"])] = current_user
+    
+    access_token = create_access_token({"sub": email})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 @app.post("/api/user/set-username")
@@ -983,8 +1135,14 @@ async def set_username(request: SetUsernameRequest, current_user = Depends(get_c
     # Update username
     await users_collection.update_one(
         {"_id": current_user["_id"]},
-        {"$set": {"username": username}}
+        {"$set": {"username": username, "name": username}}
     )
+    
+    current_user["username"] = username
+    current_user["name"] = username
+    if "email" in current_user and current_user["email"]:
+        in_memory_users[current_user["email"]] = current_user
+    in_memory_users[str(current_user["_id"])] = current_user
     
     return {"success": True, "username": username}
 
