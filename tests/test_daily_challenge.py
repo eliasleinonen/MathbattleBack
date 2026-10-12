@@ -113,3 +113,107 @@ def test_duplicate_correct_submission_blocked(client):
         assert again.status_code == 400
     finally:
         main.daily_challenges_storage.pop(_today(), None)
+
+
+def test_generate_daily_challenge_determinism():
+    """Generating challenge for the same date must always yield identical results."""
+    c1 = main.generate_daily_challenge("2026-10-15")
+    c2 = main.generate_daily_challenge("2026-10-15")
+    assert c1 == c2
+    assert c1["date"] == "2026-10-15"
+    assert "expression" in c1
+    assert "derivative" in c1
+    assert "difficulty" in c1
+    assert "category" in c1
+
+
+def test_generate_daily_challenge_weekly_schedule():
+    """
+    Weekly schedule:
+    - Monday: easy (Speed Run)
+    - Tuesday, Wednesday: medium (Chain Rule)
+    - Thursday - Sunday: hard
+    """
+    # 2026-10-12 is Monday
+    mon = main.generate_daily_challenge("2026-10-12")
+    assert mon["difficulty"] == "easy"
+    assert mon["category"] == "Speed Run"
+
+    # 2026-10-13 is Tuesday
+    tue = main.generate_daily_challenge("2026-10-13")
+    assert tue["difficulty"] == "medium"
+    assert tue["category"] == "Chain Rule"
+
+    # 2026-10-14 is Wednesday
+    wed = main.generate_daily_challenge("2026-10-14")
+    assert wed["difficulty"] == "medium"
+    assert wed["category"] == "Chain Rule"
+
+    # 2026-10-15 is Thursday
+    thu = main.generate_daily_challenge("2026-10-15")
+    assert thu["difficulty"] == "hard"
+
+    # 2026-10-16 is Friday
+    fri = main.generate_daily_challenge("2026-10-16")
+    assert fri["difficulty"] == "hard"
+
+    # 2026-10-17 is Saturday
+    sat = main.generate_daily_challenge("2026-10-17")
+    assert sat["difficulty"] == "hard"
+
+    # 2026-10-18 is Sunday
+    sun = main.generate_daily_challenge("2026-10-18")
+    assert sun["difficulty"] == "hard"
+
+
+def test_generate_daily_challenge_sympy_equivalence_across_year():
+    """Every generated question across an entire year must be mathematically valid and equivalent to its derivative."""
+    from datetime import date, timedelta
+    start = date(2026, 1, 1)
+    for i in range(365):
+        d_str = (start + timedelta(days=i)).isoformat()
+        ch = main.generate_daily_challenge(d_str)
+        assert ch["difficulty"] in ("easy", "medium", "hard")
+        assert len(ch["expression"]) > 0
+        assert len(ch["derivative"]) > 0
+        # Check that the answer passes check_math_equivalence
+        assert main.check_math_equivalence(ch["answer"], ch["derivative"]) is True
+
+
+def test_normalize_daily_difficulty():
+    """Normalize old numerical or string difficulties accurately."""
+    assert main.normalize_daily_difficulty({"difficulty": "hard", "category": "Product Rule"}) == ("hard", "Product Rule")
+    assert main.normalize_daily_difficulty({"difficulty": "easy"}) == ("easy", "Speed Run")
+    assert main.normalize_daily_difficulty({"expression": "cos(x)"}) == ("easy", "Speed Run")
+    assert main.normalize_daily_difficulty({"expression": "3·x·cos(2·x)"}) == ("hard", "Product Rule")
+    assert main.normalize_daily_difficulty({"expression": "sin(2·x)"}) == ("medium", "Chain Rule")
+
+
+def test_get_daily_challenge_endpoint_returns_difficulty(client, mock_mongo):
+    """GET /api/daily-challenge must return difficulty and category fields."""
+    today = _today()
+    main.daily_challenges_storage.pop(today, None)
+    res = client.get(
+        "/api/daily-challenge/today",
+        headers={"Authorization": "Bearer guest-test-user"},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["date"] == today
+    assert "expression" in data
+    assert data["difficulty"] in ("easy", "medium", "hard")
+    assert isinstance(data["category"], str)
+    assert len(data["category"]) > 0
+
+
+def test_submit_without_prior_get_succeeds_with_fallback(client, mock_mongo):
+    """Submitting directly without hitting GET first auto-generates challenge and succeeds."""
+    today = _today()
+    main.daily_challenges_storage.pop(today, None)
+    # Generate expected challenge to get correct answer
+    expected = main.generate_daily_challenge(today)
+    res = _submit(client, "guest-auto-gen", expected["answer"], {"time": 4.5})
+    assert res.status_code == 200
+    assert res.json()["correct"] is True
+    assert res.json()["rank"] == 1
+
