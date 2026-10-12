@@ -161,6 +161,107 @@ def _require_active_match(match: dict) -> None:
     if status != "active":
         raise HTTPException(status_code=400, detail="Match is not active")
 
+def normalize_daily_difficulty(challenge: dict) -> tuple[str, str]:
+    """Ensure a daily challenge dictionary has standard difficulty ('easy', 'medium', 'hard') and category."""
+    diff = challenge.get("difficulty")
+    cat = challenge.get("category")
+    if isinstance(diff, str) and diff.lower() in ("easy", "medium", "hard"):
+        clean_diff = diff.lower()
+        default_cat = "Speed Run" if clean_diff == "easy" else ("Chain Rule" if clean_diff == "medium" else "Product Rule")
+        return clean_diff, cat or default_cat
+    
+    expr = str(challenge.get("expression", ""))
+    if diff == 1 or expr in ("cos(x)", "sin(x)", "e^x", "e<sup>x</sup>"):
+        return "easy", cat or "Speed Run"
+    elif diff == 3 or any(k in expr for k in ("·cos(", "·sin(", "·e", "ln(x^", "^4", "^3")):
+        return "hard", cat or "Product Rule"
+    else:
+        return "medium", cat or "Chain Rule"
+
+
+def generate_daily_challenge(date_str: str) -> dict:
+    """
+    Deterministically generate a high-quality daily challenge based on date.
+    Schedule:
+    - Monday: Easy (Speed Run - clean polynomials / basic trig / exp)
+    - Tuesday, Wednesday: Medium (Chain Rule)
+    - Thursday - Sunday: Hard (Product Rule, Composite Chain Rule, Quotient Rule)
+    """
+    d = datetime.fromisoformat(date_str).date()
+    weekday = d.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
+
+    old_state = random.getstate()
+    random.seed(date_str)
+
+    try:
+        if weekday == 0:  # Monday: Easy
+            difficulty = "easy"
+            category = "Speed Run"
+            a = random.randint(2, 4)
+            b = random.randint(2, 5)
+            c = random.randint(1, 6)
+            pool = [
+                (f"{a}·x^3 - {b}·x^2 + {c}·x", f"{3*a}·x^2 - {2*b}·x + {c}"),
+                (f"{a}·x^2 + {b}·x - {c}", f"{2*a}·x + {b}"),
+                (f"{a}·sin(x) - {b}·x", f"{a}·cos(x) - {b}"),
+                (f"{a}·e<sup>x</sup> + {b}·x", f"{a}·e^x + {b}"),
+                (f"{a}·cos(x) + {b}·x^2", f"-{a}·sin(x) + {2*b}·x"),
+            ]
+            expr, deriv = random.choice(pool)
+
+        elif weekday in (1, 2):  # Tuesday, Wednesday: Medium
+            difficulty = "medium"
+            category = "Chain Rule"
+            a = random.randint(2, 4)
+            b = random.randint(1, 4)
+            pool = [
+                (f"sin({a}·x)", f"{a}·cos({a}·x)"),
+                (f"cos({a}·x)", f"-{a}·sin({a}·x)"),
+                (f"e<sup>{a}·x</sup>", f"{a}·e^({a}·x)"),
+                (f"ln({a}·x)", f"1/x"),
+                (f"({a}·x + {b})<sup>3</sup>", f"{3*a}·({a}·x + {b})^2"),
+                (f"({a}·x - {b})<sup>4</sup>", f"{4*a}·({a}·x - {b})^3"),
+                (f"e<sup>{a}·x</sup> + sin({b}·x)", f"{a}·e^({a}·x) + {b}·cos({b}·x)"),
+            ]
+            expr, deriv = random.choice(pool)
+
+        else:  # Thursday - Sunday: Hard
+            difficulty = "hard"
+            a = random.randint(2, 4)
+            b = random.randint(2, 3)
+            hard_pool = [
+                # Product Rule Trig
+                (f"{a}·x·cos({b}·x)", f"{a}·cos({b}·x) - {a*b}·x·sin({b}·x)", "Product Rule"),
+                (f"{a}·x·sin({b}·x)", f"{a}·sin({b}·x) + {a*b}·x·cos({b}·x)", "Product Rule"),
+                (f"x^2·cos(x)", f"2·x·cos(x) - x^2·sin(x)", "Product Rule"),
+                (f"x^2·sin(x)", f"2·x·sin(x) + x^2·cos(x)", "Product Rule"),
+                # Product Rule Exp & Log
+                (f"x·e<sup>{a}·x</sup>", f"e^({a}·x) + {a}·x·e^({a}·x)", "Product Rule"),
+                (f"x^2·e<sup>x</sup>", f"2·x·e^x + x^2·e^x", "Product Rule"),
+                (f"{a}·x·ln(x)", f"{a}·ln(x) + {a}", "Product Rule"),
+                # Composite Chain Rule
+                (f"sin(x<sup>2</sup>)", f"2·x·cos(x^2)", "Chain Rule"),
+                (f"({a}·x^2 + {b})<sup>3</sup>", f"{6*a}·x·({a}·x^2 + {b})^2", "Chain Rule"),
+                (f"x^3·ln(x)", f"3·x^2·ln(x) + x^2", "Product Rule"),
+                (f"({a}·x + {b})<sup>4</sup>", f"{4*a}·({a}·x + {b})^3", "Chain Rule"),
+                (f"sin(e<sup>x</sup>)", f"cos(e^x)·e^x", "Chain Rule"),
+            ]
+            item = random.choice(hard_pool)
+            expr, deriv, category = item[0], item[1], item[2]
+
+        return {
+            "date": date_str,
+            "expression": expr,
+            "derivative": deriv,
+            "answer": deriv,
+            "difficulty": difficulty,
+            "category": category,
+            "difficulty_level": 1 if difficulty == "easy" else 2 if difficulty == "medium" else 3,
+        }
+    finally:
+        random.setstate(old_state)
+
+
 # Pre-generate 100 daily challenges
 def initialize_daily_challenges():
     """Pre-generate daily challenges for the next 100 days"""
@@ -171,24 +272,7 @@ def initialize_daily_challenges():
         date_str = challenge_date.isoformat()
         
         if date_str not in daily_challenges_storage:
-            # Use date hash for deterministic ELO
-            date_hash = sum(ord(c) for c in date_str)
-            elo_options = [1300, 1400, 1500, 1600]
-            elo = elo_options[date_hash % len(elo_options)]
-            
-            # Seed random with date for consistency
-            old_state = random.getstate()
-            random.seed(date_str)
-            question = generate_question(elo)
-            random.setstate(old_state)
-            
-            daily_challenges_storage[date_str] = {
-                "date": date_str,
-                "expression": question["expression"],
-                "derivative": question["derivative"],
-                "answer": question["answer"],
-                "difficulty": question.get("difficulty", 2)
-            }
+            daily_challenges_storage[date_str] = generate_daily_challenge(date_str)
     
     print(f"[INFO] Pre-generated {len(daily_challenges_storage)} daily challenges")
 
@@ -2799,31 +2883,13 @@ async def get_daily_challenge(current_user: dict = Depends(get_current_user)):
     # Check if daily challenge exists for today
     if today not in daily_challenges_storage:
         print(f"[DEBUG] Challenge not in memory, generating new one...")
-        # Generate a new challenge with deterministic ELO based on date
-        # Use date hash to ensure same challenge for everyone on same day
-        date_hash = sum(ord(c) for c in today)
-        elo_options = [1300, 1400, 1500, 1600]
-        elo = elo_options[date_hash % len(elo_options)]
-        
-        # Set random seed based on date for consistent challenge generation
-        # This ensures everyone gets the same question on the same day
-        old_state = random.getstate()
-        random.seed(today)
-        question = generate_question(elo)
-        random.setstate(old_state)  # Restore previous random state
-        
-        print(f"[DEBUG] Generated question: {question['expression']}")
-        
-        daily_challenges_storage[today] = {
-            "date": today,
-            "expression": question["expression"],
-            "derivative": question["derivative"],
-            "answer": question["answer"],
-            "difficulty": question.get("difficulty", 2)
-        }
+        daily_challenges_storage[today] = generate_daily_challenge(today)
     
     daily_challenge = daily_challenges_storage[today]
-    print(f"[DEBUG] Challenge found: {daily_challenge['expression']}")
+    diff_name, cat_name = normalize_daily_difficulty(daily_challenge)
+    daily_challenge["difficulty"] = diff_name
+    daily_challenge["category"] = cat_name
+    print(f"[DEBUG] Challenge found: {daily_challenge['expression']} ({diff_name} - {cat_name})")
     
     # Check if user has completed today's challenge
     completion_key = (str(current_user["_id"]), today)
@@ -2832,6 +2898,8 @@ async def get_daily_challenge(current_user: dict = Depends(get_current_user)):
     return {
         "date": today,
         "expression": daily_challenge["expression"],
+        "difficulty": diff_name,
+        "category": cat_name,
         "user_completed": user_completion is not None,
         "user_time": user_completion.get("time") if user_completion else None,
         "user_rank": user_completion.get("rank") if user_completion else None
@@ -2966,9 +3034,12 @@ async def get_daily_history(current_user: dict = Depends(get_current_user)):
             winner_username = winner_user.get("username", "Anonymous") if winner_user else "Anonymous"
             best_time = winner["time"]
         
+        diff_name, cat_name = normalize_daily_difficulty(challenge)
         challenges_with_winners.append({
             "date": challenge["date"],
             "expression": challenge["expression"],
+            "difficulty": diff_name,
+            "category": cat_name,
             "winner_username": winner_username,
             "best_time": best_time
         })
@@ -3010,7 +3081,7 @@ async def submit_daily_challenge(
     
     # Get the challenge
     if today not in daily_challenges_storage:
-        raise HTTPException(status_code=404, detail="Challenge not found")
+        daily_challenges_storage[today] = generate_daily_challenge(today)
     
     challenge = daily_challenges_storage[today]
     
