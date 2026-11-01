@@ -452,295 +452,132 @@ def format_term(coef, term=""):
         return f"- {abs(coef)}{term}"
 
 def random_poly_easy():
-    """Generate easy polynomials (degree 2-3, 3-4 terms)"""
-    expressions = []
-    
-    # x^3 with 3 terms
-    a = random.randint(1, 3)
-    b = random.randint(-4, 4)
-    c = random.randint(-5, 5)
-    if b != 0 and c != 0:
-        expr = f"{a}·x^3 {format_term(b, '·x^2')} {format_term(c, '·x')}"
-        deriv = f"{3*a}·x^2 {format_term(2*b, '·x')} {format_term(c)}"
-        expressions.append((expr, deriv))
-    
-    # x^3 with 4 terms
-    a = random.randint(1, 2)
-    b = random.randint(-3, 3)
-    c = random.randint(-4, 4)
-    d = random.randint(-5, 5)
-    if b != 0 and c != 0 and d != 0:
-        expr = f"{a}·x^3 {format_term(b, '·x^2')} {format_term(c, '·x')} {format_term(d)}"
-        deriv = f"{3*a}·x^2 {format_term(2*b, '·x')} {format_term(c)}"
-        expressions.append((expr, deriv))
-    
-    # x^2 with 3 terms
-    a = random.randint(1, 4)
-    b = random.randint(-5, 5)
-    c = random.randint(-6, 6)
-    if b != 0 and c != 0:
-        expr = f"{a}·x^2 {format_term(b, '·x')} {format_term(c)}"
-        deriv = f"{2*a}·x {format_term(b)}"
-        expressions.append((expr, deriv))
+    """Generate easy derivatives: 1-2 terms, power rule, constants, and basic trig/exp."""
+    pool = []
 
-    if not expressions:
-        return ("2·x^2 + 4·x + 6", "4·x + 4")
-    return random.choice(expressions)
+    # 1. Linear & Constant derivatives
+    a = random.randint(2, 9)
+    b = random.randint(1, 9)
+    pool.append((f"{a}·x + {b}", f"{a}"))
+    pool.append((f"{a}·x", f"{a}"))
+    pool.append((f"{b} - {a}·x", f"-{a}"))
+
+    # 2. Pure Monomial Power Rule
+    a = random.randint(2, 6)
+    pool.append((f"{a}·x^2", f"{2*a}·x"))
+    pool.append(("x^3", "3·x^2"))
+    pool.append((f"{a}·x^3", f"{3*a}·x^2"))
+    pool.append(("x^4", "4·x^3"))
+
+    # 3. Clean 2-term quadratics and cubics
+    a = random.randint(1, 4)
+    b = random.randint(2, 7)
+    pool.append((f"{a}·x^2 + {b}·x", f"{2*a}·x + {b}"))
+    pool.append((f"{a}·x^2 - {b}", f"{2*a}·x"))
+    pool.append((f"x^3 + {b}·x", f"3·x^2 + {b}"))
+    pool.append((f"x^3 - {b}·x", f"3·x^2 - {b}"))
+
+    # 4. Elementary Trig & Exponential
+    a = random.randint(2, 5)
+    pool.append(("sin(x)", "cos(x)"))
+    pool.append(("cos(x)", "-sin(x)"))
+    pool.append(("e<sup>x</sup>", "e^x"))
+    pool.append((f"{a}·e<sup>x</sup>", f"{a}·e^x"))
+    pool.append((f"{a}·sin(x)", f"{a}·cos(x)"))
+    pool.append((f"{a}·cos(x)", f"-{a}·sin(x)"))
+
+    return random.choice(pool)
+
 
 def random_poly_medium():
-    """Generate medium polynomials (degree 4-5, 3-4 terms)"""
-    expressions = []
-    
-    # x^4 with 4 terms
-    a = random.randint(1, 2)
-    b = random.randint(-3, 3)
-    c = random.randint(-3, 3)
-    d = random.randint(-4, 4)
-    if b != 0 and c != 0 and d != 0:
-        expr = f"{a}·x^4 {format_term(b, '·x^3')} {format_term(c, '·x^2')} {format_term(d, '·x')}"
-        deriv = f"{4*a}·x^3 {format_term(3*b, '·x^2')} {format_term(2*c, '·x')} {format_term(d)}"
-        expressions.append((expr, deriv))
-    
-    # x^5 with 4 terms
-    a = random.randint(1, 2)
-    b = random.randint(-2, 2)
-    c = random.randint(-3, 3)
-    d = random.randint(-3, 3)
-    if b != 0 and c != 0 and d != 0:
-        expr = f"{a}·x^5 {format_term(b, '·x^4')} {format_term(c, '·x^2')} {format_term(d, '·x')}"
-        deriv = f"{5*a}·x^4 {format_term(4*b, '·x^3')} {format_term(2*c, '·x')} {format_term(d)}"
-        expressions.append((expr, deriv))
-    
-    # x^4 with 3 terms
-    a = random.randint(1, 3)
-    b = random.randint(-3, 3)
-    c = random.randint(-4, 4)
-    if b != 0 and c != 0:
-        expr = f"{a}·x^4 {format_term(b, '·x^2')} {format_term(c, '·x')}"
-        deriv = f"{4*a}·x^3 {format_term(2*b, '·x')} {format_term(c)}"
-        expressions.append((expr, deriv))
-    
-    # x^5 with 3 terms
-    a = random.randint(1, 2)
-    b = random.randint(-3, 3)
-    c = random.randint(-3, 3)
-    if b != 0 and c != 0:
-        expr = f"{a}·x^5 {format_term(b, '·x^3')} {format_term(c, '·x')}"
-        deriv = f"{5*a}·x^4 {format_term(3*b, '·x^2')} {format_term(c)}"
-        expressions.append((expr, deriv))
-    
-    # Easy exponentials with superscript (expression has HTML, derivative uses ^)
-    expressions.append(("e<sup>x</sup>", "e^x"))
-    a = random.randint(2, 3)
-    expressions.append((f"e<sup>{a}x</sup>", f"{a}·e^({a}·x)"))
-    expressions.append((f"{a}·e<sup>x</sup>", f"{a}·e^x"))
-    
-    # Easy trig
-    expressions.append(("sin(x)", "cos(x)"))
-    expressions.append(("cos(x)", "-sin(x)"))
-    a = random.randint(2, 3)
-    expressions.append((f"sin({a}·x)", f"{a}·cos({a}·x)"))
-    
-    # Easy logarithms
-    expressions.append(("ln(x)", "1/x"))
-    a = random.randint(2, 4)
-    expressions.append((f"{a}·ln(x)", f"{a}/x"))
-    
-    # Simple square root: √x = x^(1/2), derivative = (1/2)·x^(-1/2) = 1/(2√x)
-    expressions.append(("√x", "1/(2·√x)"))
-    a = random.randint(2, 4)
-    expressions.append((f"{a}·√x", f"{a}/(2·√x)"))
-    
-    return random.choice(expressions)
+    """Generate medium derivatives: scaled trig/exp, logs, roots, and clean polynomials."""
+    pool = []
 
-def random_poly_hard():
-    """Generate varied difficulty derivative questions"""
-    expressions = []
-    
-    # Basic exponential and trig (keep original simple ones)
-    expressions.append(("e<sup>x</sup>", "e^x", "is_exp"))
-    a = random.randint(2, 5)
-    expressions.append((f"e<sup>{a}x</sup>", f"{a}·e^({a}·x)", "is_exp"))
-    
-    expressions.append(("sin(x)", "cos(x)", "is_trig"))
-    expressions.append(("cos(x)", "-sin(x)", "is_trig"))
+    # 1. Scaled Trig & Exponential (Introductory Chain Rule)
     a = random.randint(2, 4)
-    expressions.append((f"sin({a}·x)", f"{a}·cos({a}·x)", "is_trig"))
-    expressions.append((f"cos({a}·x)", f"-{a}·sin({a}·x)", "is_trig"))
-    
-    expressions.append(("ln(x)", "<div class='fraction'><span class='numerator'>1</span><span class='denominator'>x</span></div>", "is_log"))
-    
-    # 1. 1/x → -1/x^2
-    expressions.append((
-        "<div class='fraction'><span class='numerator'>1</span><span class='denominator'>x</span></div>",
-        "<div class='fraction'><span class='numerator'>-1</span><span class='denominator'>x^2</span></div>",
-        None
-    ))
-    
-    # 2. 1/x^2 → -2/x^3
-    expressions.append((
-        "<div class='fraction'><span class='numerator'>1</span><span class='denominator'>x<sup>2</sup></span></div>",
-        "<div class='fraction'><span class='numerator'>-2</span><span class='denominator'>x^3</span></div>",
-        None
-    ))
-    
-    # 3. √x → 1/(2√x)
-    expressions.append((
-        "√x",
-        "<div class='fraction'><span class='numerator'>1</span><span class='denominator'>2·√x</span></div>",
-        None
-    ))
-    
-    # 7. x/2 → 1/2
-    expressions.append((
-        "<div class='fraction'><span class='numerator'>x</span><span class='denominator'>2</span></div>",
-        "<div class='fraction'><span class='numerator'>1</span><span class='denominator'>2</span></div>",
-        None
-    ))
-    
-    # 9. e^x + 2x → e^x + 2
-    expressions.append((
-        "e<sup>x</sup> + 2·x",
-        "e^x + 2",
-        "is_exp"
-    ))
-    
-    # 10. e^x - x^2 → e^x - 2x
-    expressions.append((
-        "e<sup>x</sup> - x<sup>2</sup>",
-        "e^x - 2·x",
-        "is_exp"
-    ))
-    
-    # 11. 3e^x → 3e^x
+    pool.append((f"sin({a}·x)", f"{a}·cos({a}·x)"))
+    pool.append((f"cos({a}·x)", f"-{a}·sin({a}·x)"))
+    pool.append((f"e<sup>{a}·x</sup>", f"{a}·e^({a}·x)"))
+    b = random.randint(2, 4)
+    pool.append((f"{a}·e<sup>{b}·x</sup>", f"{a*b}·e^({b}·x)"))
+    c = random.randint(1, 5)
+    pool.append((f"sin({a}·x) + {c}·x", f"{a}·cos({a}·x) + {c}"))
+    pool.append((f"e<sup>{a}·x</sup> - {c}·x", f"{a}·e^({a}·x) - {c}"))
+
+    # 2. Logarithms & Roots (All clean math answers)
+    pool.append(("ln(x)", "1/x"))
     a = random.randint(2, 5)
-    expressions.append((
-        f"{a}·e<sup>x</sup>",
-        f"{a}·e^x",
-        "is_exp"
-    ))
-    
-    # 12. 2sin(x) → 2cos(x)
+    pool.append((f"{a}·ln(x)", f"{a}/x"))
+    pool.append((f"ln({a}·x)", "1/x"))
+    pool.append(("√x", "1/(2·√x)"))
     a = random.randint(2, 4)
-    expressions.append((
-        f"{a}·sin(x)",
-        f"{a}·cos(x)",
-        "is_trig"
-    ))
-    
-    # 13. x·e^x → e^x + x·e^x
-    expressions.append((
-        "x·e<sup>x</sup>",
-        "e^x + x·e^x",
-        "is_exp"
-    ))
-    
-    # 14. (2x + 2)^3 → 6(2x + 2)^2
-    expressions.append((
-        "(2·x + 2)<sup>3</sup>",
-        "6·(2·x + 2)^2",
-        None
-    ))
-    
-    # 16. e^(2x) → 2e^(2x)
-    a = random.randint(2, 4)
-    expressions.append((
-        f"e<sup>{a}·x</sup>",
-        f"{a}·e^({a}·x)",
-        "is_exp"
-    ))
-    
-    # 17. e^(3x) → 3e^(3x) (already covered by #16 with random)
-    
-    # 18. sin(2x) → 2cos(2x) (already covered in original)
-    
-    # 19. (x + 1)^2 → 2(x + 1)
-    a = random.randint(1, 3)
-    expressions.append((
-        f"(x + {a})<sup>2</sup>",
-        f"2·(x + {a})",
-        None
-    ))
-    
-    # 20. sin(e^x) → cos(e^x)·e^x
-    expressions.append((
-        "sin(e<sup>x</sup>)",
-        "cos(e^x)·e^x",
-        "is_trig"
-    ))
-    
-    # 21. sin(e^(3x)) → 3e^(3x)·cos(e^(3x))
-    a = random.randint(2, 4)
-    expressions.append((
-        f"sin(e<sup>{a}·x</sup>)",
-        f"{a}·e^({a}·x)·cos(e^({a}·x))",
-        "is_trig"
-    ))
-    
-    # 22. e^(x^2) → 2x·e^(x^2)
-    n = random.randint(2, 3)
-    expressions.append((
-        f"e<sup>x<sup>{n}</sup></sup>",
-        f"{n}·x^{n-1}·e^(x^{n})",
-        "is_exp"
-    ))
-    
-    # 23. ln(2x) → 1/x
+    pool.append((f"{a}·√x", f"{a}/(2·√x)"))
+
+    # 3. Simple fractions / powers
+    pool.append(("<div class='fraction'><span class='numerator'>1</span><span class='denominator'>x</span></div>", "-1/x^2"))
     a = random.randint(2, 5)
-    expressions.append((
-        f"ln({a}·x)",
-        "<div class='fraction'><span class='numerator'>1</span><span class='denominator'>x</span></div>",
-        "is_log"
-    ))
-    
-    # 24. cos(x^2) → -2x·sin(x^2)
-    n = random.randint(2, 3)
-    expressions.append((
-        f"cos(x<sup>{n}</sup>)",
-        f"-{n}·x^{n-1}·sin(x^{n})",
-        "is_trig"
-    ))
-    
-    # Keep some harder quotient rule ones
-    a = random.randint(2, 5)
-    expressions.append((
-        f"<div class='fraction'><span class='numerator'>1</span><span class='denominator'>{a}·e<sup>x</sup></span></div>",
-        f"<div class='fraction'><span class='numerator'>-1</span><span class='denominator'>{a}·e^x</span></div>",
-        "is_exp"
-    ))
-    
-    expressions.append((
-        "<div class='fraction'><span class='numerator'>1</span><span class='denominator'>cos(x)</span></div>",
-        "<div class='fraction'><span class='numerator'>sin(x)</span><span class='denominator'>cos^2(x)</span></div>",
-        "is_trig"
-    ))
-    
-    # Reduce polynomial complexity - simpler ones
+    pool.append((f"<div class='fraction'><span class='numerator'>{a}</span><span class='denominator'>x</span></div>", f"-{a}/x^2"))
+
+    # 4. Binomial powers (Chain Rule intro)
+    a = random.randint(1, 4)
+    pool.append((f"(x + {a})<sup>2</sup>", f"2·(x + {a})"))
+    pool.append((f"(x - {a})<sup>3</sup>", f"3·(x - {a})^2"))
+
+    # 5. Clean 3-term polynomials
     a = random.randint(1, 3)
     b = random.randint(1, 4)
-    expr = f"{a}·x<sup>3</sup> + {b}·x"
-    deriv = f"{3*a}·x^2 + {b}"
-    expressions.append((expr, deriv, None))
-    
-    choice = random.choice(expressions)
-    if len(choice) == 3:
-        return (choice[0], choice[1], choice[2])
-    return (choice[0], choice[1], None)
+    c = random.randint(1, 5)
+    pool.append((f"{a}·x^3 + {b}·x^2 + {c}·x", f"{3*a}·x^2 + {2*b}·x + {c}"))
+    pool.append((f"{a}·x^4 - {b}·x^2", f"{4*a}·x^3 - {2*b}·x"))
+    pool.append((f"{a}·x^3 - {b}·x + {c}", f"{3*a}·x^2 - {b}"))
+
+    return random.choice(pool)
+
+
+def random_poly_hard():
+    """Generate hard derivatives: Product Rule, Composite Chain Rule, and Quotients."""
+    pool = []
+
+    # 1. Product Rule
+    pool.append(("x·e<sup>x</sup>", "e^x + x·e^x", "is_exp"))
+    pool.append(("x·sin(x)", "sin(x) + x·cos(x)", "is_trig"))
+    pool.append(("x·cos(x)", "cos(x) - x·sin(x)", "is_trig"))
+    pool.append(("x^2·e<sup>x</sup>", "2·x·e^x + x^2·e^x", "is_exp"))
+    pool.append(("x·ln(x)", "ln(x) + 1", "is_log"))
+    pool.append(("x^2·sin(x)", "2·x·sin(x) + x^2·cos(x)", "is_trig"))
+    pool.append(("x^2·cos(x)", "2·x·cos(x) - x^2·sin(x)", "is_trig"))
+    a = random.randint(2, 4)
+    pool.append((f"x·e<sup>{a}·x</sup>", f"e^({a}·x) + {a}·x·e^({a}·x)", "is_exp"))
+
+    # 2. Composite Chain Rule
+    pool.append(("sin(x<sup>2</sup>)", "2·x·cos(x^2)", "is_trig"))
+    pool.append(("cos(x<sup>2</sup>)", "-2·x·sin(x^2)", "is_trig"))
+    pool.append(("e<sup>x<sup>2</sup></sup>", "2·x·e^(x^2)", "is_exp"))
+    pool.append(("sin(e<sup>x</sup>)", "cos(e^x)·e^x", "is_trig"))
+    a = random.randint(2, 4)
+    pool.append((f"sin(e<sup>{a}·x</sup>)", f"{a}·e^({a}·x)·cos(e^({a}·x))", "is_trig"))
+    a = random.randint(2, 3)
+    b = random.randint(1, 3)
+    pool.append((f"({a}·x + {b})<sup>3</sup>", f"{3*a}·({a}·x + {b})^2", None))
+    pool.append((f"({a}·x^2 + {b})<sup>2</sup>", f"{4*a}·x·({a}·x^2 + {b})", None))
+
+    # 3. Rational & Quotient Powers (Clean string answers with HTML display)
+    pool.append(("<div class='fraction'><span class='numerator'>1</span><span class='denominator'>x<sup>2</sup></span></div>", "-2/x^3", None))
+    pool.append(("<div class='fraction'><span class='numerator'>1</span><span class='denominator'>x<sup>3</sup></span></div>", "-3/x^4", None))
+    pool.append(("<div class='fraction'><span class='numerator'>x</span><span class='denominator'>2</span></div>", "1/2", None))
+    pool.append(("<div class='fraction'><span class='numerator'>1</span><span class='denominator'>cos(x)</span></div>", "sin(x)/cos(x)^2", "is_trig"))
+    a = random.randint(2, 5)
+    pool.append((f"<div class='fraction'><span class='numerator'>1</span><span class='denominator'>{a}·e<sup>x</sup></span></div>", f"-1/({a}·e^x)", "is_exp"))
+
+    choice = random.choice(pool)
+    return (choice[0], choice[1], choice[2] if len(choice) > 2 else None)
 
 
 def generate_question(elo: int) -> dict:
     """Generate a derivative question based on ELO"""
-    
-    # Select difficulty based on ELO - always ask for derivative only
-    # 800-1200: Mix of easy and medium questions
-    if elo < 1200:
-        # 50/50 chance of easy or medium
-        if random.choice([True, False]):
-            expr, deriv = random_poly_easy()
-            difficulty = 1
-        else:
-            expr, deriv = random_poly_medium()
-            difficulty = 2
+    if elo < 1150:
+        expr, deriv = random_poly_easy()
+        difficulty = 1
         special_type = None
     elif elo < 1500:
         expr, deriv = random_poly_medium()
@@ -751,10 +588,10 @@ def generate_question(elo: int) -> dict:
         expr, deriv = result[0], result[1]
         special_type = result[2] if len(result) == 3 else None
         difficulty = 3
-    
+
     # Always set evaluate_at for storage consistency
     evaluate_at = random.randint(1, 5)
-    
+
     return {
         "expression": expr,
         "derivative": deriv,
@@ -806,9 +643,32 @@ _LARGE_EXPONENT_RE = re.compile(r"\*\*\s*\(?\s*-?\s*\d{4,}")
 
 
 def normalize_answer_text(expr: str) -> str:
-    """Shared preprocessing: normalize unicode operators and ^ to Python syntax."""
+    """Shared preprocessing: normalize unicode operators, HTML fractions/tags, and ^ to Python syntax."""
     s = str(expr).strip()
+    # Normalize unicode multiplication
     s = s.replace('·', '*').replace('×', '*').replace('∗', '*')
+    # Convert HTML fraction divs: <div class='fraction'><span class='numerator'>N</span><span class='denominator'>D</span></div> -> ((N)/(D))
+    s = re.sub(
+        r"<div[^>]*class=['\"]fraction['\"][^>]*>\s*<span[^>]*class=['\"]numerator['\"][^>]*>(.*?)</span>\s*<span[^>]*class=['\"]denominator['\"][^>]*>(.*?)</span>\s*</div>",
+        r'((\1)/(\2))',
+        s,
+        flags=re.DOTALL | re.IGNORECASE
+    )
+    # Handle nested <sup> tags by resolving innermost first
+    while '<sup>' in s.lower():
+        s_new = re.sub(r'<sup>([^<>]*)</sup>', r'**(\1)', s, flags=re.IGNORECASE)
+        if s_new == s:
+            break
+        s = s_new
+    # Strip any remaining HTML tags (<span>, </div>, etc.)
+    s = re.sub(r'<[^>]+>', '', s)
+    # Convert square root symbol: √x or √(x) -> sqrt(...)
+    s = re.sub(r'√\((.*?)\)', r'sqrt(\1)', s)
+    s = re.sub(r'√([a-zA-Z0-9_]+)', r'sqrt(\1)', s)
+    s = s.replace('√', 'sqrt')
+    # Convert ln(...) -> log(...)
+    s = s.replace('ln(', 'log(')
+    # Standardize powers
     s = s.replace('^', '**')
     return s
 
