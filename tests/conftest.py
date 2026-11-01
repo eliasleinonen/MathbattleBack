@@ -50,6 +50,10 @@ async def _mock_update_one(*args, **kwargs):
     return _FakeUpdateResult()
 
 
+async def _mock_delete_one(*args, **kwargs):
+    return _FakeUpdateResult()
+
+
 def _mock_find(*args, **kwargs):
     return _FakeCursor([])
 
@@ -89,11 +93,13 @@ def mock_mongo(monkeypatch):
         main.rounds_collection,
         main.daily_challenges_collection,
         main.daily_completions_collection,
+        main.push_subscriptions_collection,
     ]
     for collection in collections:
         monkeypatch.setattr(collection, "find_one", _mock_find_one)
         monkeypatch.setattr(collection, "insert_one", _mock_insert_one)
         monkeypatch.setattr(collection, "update_one", _mock_update_one)
+        monkeypatch.setattr(collection, "delete_one", _mock_delete_one)
         monkeypatch.setattr(collection, "find", _mock_find)
 
 
