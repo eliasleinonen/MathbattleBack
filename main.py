@@ -10,6 +10,7 @@ from typing import Optional, List, Union
 from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
 import asyncio
+import json
 import logging
 import os
 import re
@@ -34,6 +35,30 @@ DATABASE_NAME = "derivative_duel"
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://mathbattle.xyz")
 # Google OAuth: sign-in and daily challenges require this to be set in the environment.
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip().strip('"').strip("'")
+
+MATCHMAKING_QUEUE_SECONDS = int(os.getenv("MATCHMAKING_QUEUE_SECONDS", "60"))
+VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
+if VAPID_PRIVATE_KEY.startswith('"') and VAPID_PRIVATE_KEY.endswith('"'):
+    VAPID_PRIVATE_KEY = VAPID_PRIVATE_KEY[1:-1]
+VAPID_PRIVATE_KEY = VAPID_PRIVATE_KEY.replace("\\n", "\n")
+VAPID_CLAIMS_EMAIL = os.getenv("VAPID_CLAIMS_EMAIL", "mailto:notifications@derivative-duel.com")
+
+vapid_instance = None
+try:
+    from py_vapid import Vapid
+    if VAPID_PRIVATE_KEY and "-----BEGIN" in VAPID_PRIVATE_KEY:
+        vapid_instance = Vapid.from_pem(VAPID_PRIVATE_KEY.encode("utf-8"))
+    else:
+        vapid_instance = Vapid()
+        vapid_instance.generate_keys()
+        import base64
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        raw_pub = vapid_instance.public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+        VAPID_PUBLIC_KEY = base64.urlsafe_b64encode(raw_pub).rstrip(b"=").decode("utf-8")
+except Exception as e:
+    logger = logging.getLogger("derivative_duel")
+    logger.warning("VAPID setup warning: %s", e)
 
 if not GOOGLE_CLIENT_ID:
     print("[WARNING] GOOGLE_CLIENT_ID is not set - Google login and daily challenges will be unavailable")
@@ -284,6 +309,7 @@ matches_collection = db.matches
 rounds_collection = db.rounds
 daily_challenges_collection = db.DailyChallenge
 daily_completions_collection = db.DailyChallengeCompletion
+push_subscriptions_collection = db.push_subscriptions
 
 
 # Models
@@ -310,8 +336,20 @@ class UpgradeGuestRequest(BaseModel):
 
 
 class MatchStart(BaseModel):
-    mode: str  # "random" or "friend"
+    mode: str  # "random", "friend", or "bot"
     continue_existing: Optional[bool] = False  # Whether to continue an existing match
+    force_bot: Optional[bool] = False  # Skip waiting and play against bot immediately
+
+
+class PushSubscriptionKeys(BaseModel):
+    p256dh: str
+    auth: str
+
+
+class PushSubscriptionPayload(BaseModel):
+    endpoint: str
+    keys: PushSubscriptionKeys
+    expirationTime: Optional[float] = None
 
 
 class FriendMatchCreate(BaseModel):
@@ -1369,6 +1407,137 @@ async def cancel_challenge(match_id: str, current_user = Depends(get_current_use
     return {"status": "cancelled"}
 
 
+async def send_matchmaking_push_notifications(initiator_id: str):
+    """Notify subscribed players when a user enters the matchmaking queue."""
+    if not vapid_instance:
+        return
+
+    try:
+        now = datetime.utcnow()
+        cooldown_threshold = now - timedelta(minutes=30)
+
+        # Notify active subscribers (up to 50) who are not the initiator and haven't been pinged in 30m
+        query = {
+            "user_id": {"$ne": initiator_id},
+            "$or": [
+                {"last_notified_at": None},
+                {"last_notified_at": {"$lt": cooldown_threshold}},
+            ],
+        }
+
+        cursor = push_subscriptions_collection.find(query).limit(50)
+        subscriptions = await cursor.to_list(length=50)
+        if not subscriptions:
+            return
+
+        payload = json.dumps({
+            "title": "Derivative Duel ⚔️",
+            "body": "A challenger is waiting in queue! Tap to play a 1v1 duel.",
+            "icon": "/favicon.svg",
+            "badge": "/favicon.svg",
+            "data": {
+                "url": "/play/random",
+            },
+        })
+
+        def _send_one(sub_doc):
+            sub_info = {
+                "endpoint": sub_doc["endpoint"],
+                "keys": sub_doc["keys"],
+            }
+            try:
+                from pywebpush import webpush
+                webpush(
+                    subscription_info=sub_info,
+                    data=payload,
+                    vapid_private_key=vapid_instance,
+                    vapid_claims={"sub": VAPID_CLAIMS_EMAIL},
+                    ttl=120,
+                    timeout=5,
+                )
+                return sub_doc["endpoint"], True, None
+            except Exception as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                return sub_doc["endpoint"], False, status_code
+
+        results = await asyncio.gather(
+            *[asyncio.to_thread(_send_one, s) for s in subscriptions],
+            return_exceptions=True,
+        )
+
+        for res in results:
+            if isinstance(res, tuple):
+                endpoint, success, status_code = res
+                if success:
+                    try:
+                        await push_subscriptions_collection.update_one(
+                            {"endpoint": endpoint},
+                            {"$set": {"last_notified_at": datetime.utcnow()}},
+                        )
+                    except Exception:
+                        pass
+                elif status_code in (404, 410):
+                    try:
+                        await push_subscriptions_collection.delete_one({"endpoint": endpoint})
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning("Error dispatching matchmaking push notifications: %s", e)
+
+
+async def _create_bot_match(user_id: str, user_elo: int) -> dict:
+    """Instantly create and start a match against an AI bot."""
+    bot_names = ["James (bot)", "Alex (bot)", "Sam (bot)", "Taylor (bot)", "Jordan (bot)", "Casey (bot)", "Morgan (bot)"]
+    bot_name = random.choice(bot_names)
+    bot_elo_offset = random.randint(-150, -50)  # Bot is 50-150 ELO lower
+    bot = {
+        "_id": "bot-opponent",
+        "email": "bot@derivative-duel.com",
+        "name": bot_name,
+        "elo": user_elo + bot_elo_offset,
+        "wins": 0,
+        "losses": 0
+    }
+
+    match_id = new_match_id()
+    match_code = secrets.token_urlsafe(8)
+
+    match_doc = {
+        "_id": match_id,
+        "match_code": match_code,
+        "match_type": "random",  # Bot match
+        "player1_id": ObjectId(user_id) if ObjectId.is_valid(user_id) else user_id,
+        "player2_id": bot["_id"],
+        "player1_score": 0,
+        "player2_score": 0,
+        "player1_elo": user_elo,
+        "player2_elo": bot["elo"],
+        "status": "active",
+        "winner_id": None,
+        "elo_change": 0,
+        "rounds": [],
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+
+    in_memory_matches[match_id] = match_doc
+    existing_match = await matches_collection.find_one({"_id": match_id})
+    if not existing_match:
+        await matches_collection.insert_one(match_doc.copy())
+    else:
+        await matches_collection.update_one(
+            {"_id": match_id},
+            {"$set": match_doc}
+        )
+
+    return {
+        "status": "matched",
+        "match_id": match_id,
+        "match_code": match_code,
+        "opponent": bot_name
+    }
+
+
 @app.post("/api/game/start")
 async def start_match(match_data: MatchStart, current_user = Depends(get_current_user)):
     user_id = str(current_user["_id"])  # Convert to string for consistent comparison
@@ -1415,6 +1584,12 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
                         {"$set": {"status": "abandoned", "updated_at": datetime.utcnow()}}
                     )
     
+    # If explicitly requesting a bot match (e.g. "Play a bot now"), bypass queue
+    if match_data.force_bot or match_data.mode == "bot":
+        matchmaking_queue.pop(user_id, None)
+        cancelled_users.discard(user_id)
+        return await _create_bot_match(user_id, user_elo)
+
     # Try to find any opponent from the queue (no ELO restriction)
     opponent_id = None
     opponent_queue_entry = None
@@ -1494,14 +1669,14 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
     if user_id in matchmaking_queue:
         # Actively searching again, so any earlier cancel no longer applies.
         cancelled_users.discard(user_id)
-        # Check if 10 seconds have passed
+        # Check if queue duration has passed
         time_in_queue = (datetime.utcnow() - matchmaking_queue[user_id]["joined_at"]).total_seconds()
         
         # Still searching
-        if time_in_queue < 10:
+        if time_in_queue < MATCHMAKING_QUEUE_SECONDS:
             return {
                 "status": "searching",
-                "time_remaining": int(10 - time_in_queue)
+                "time_remaining": int(MATCHMAKING_QUEUE_SECONDS - time_in_queue)
             }
         # Time expired, create bot match
     else:
@@ -1512,12 +1687,15 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
             "elo": user_elo,
             "joined_at": datetime.utcnow()
         }
+        # First time joining the queue with no waiting opponent:
+        # Alert subscribers in background so real players can join
+        asyncio.create_task(send_matchmaking_push_notifications(user_id))
         return {
             "status": "searching",
-            "time_remaining": 10
+            "time_remaining": MATCHMAKING_QUEUE_SECONDS
         }
     
-    # No opponent found within ELO range, create bot match after 10 seconds
+    # No opponent found within queue duration, create bot match
     matchmaking_queue.pop(user_id, None)
     
     # Check if user cancelled during matchmaking
@@ -1525,59 +1703,7 @@ async def start_match(match_data: MatchStart, current_user = Depends(get_current
         cancelled_users.discard(user_id)
         return {"status": "cancelled"}
     
-    # Create bot opponent with calibrated difficulty and random name
-    bot_names = ["James (bot)", "Alex (bot)", "Sam (bot)", "Taylor (bot)", "Jordan (bot)", "Casey (bot)", "Morgan (bot)"]
-    bot_name = random.choice(bot_names)
-    bot_elo_offset = random.randint(-150, -50)  # Bot is 50-150 ELO lower
-    bot = {
-        "_id": "bot-opponent",
-        "email": "bot@derivative-duel.com",
-        "name": bot_name,
-        "elo": user_elo + bot_elo_offset,
-        "wins": 0,
-        "losses": 0
-    }
-    
-    # Create match
-    match_id = new_match_id()
-    match_code = secrets.token_urlsafe(8)  # Generate unique code
-    
-    match_doc = {
-        "_id": match_id,
-        "match_code": match_code,
-        "match_type": "random",  # Bot match
-        "player1_id": ObjectId(user_id) if ObjectId.is_valid(user_id) else user_id,
-        "player2_id": bot["_id"],
-        "player1_score": 0,
-        "player2_score": 0,
-        "player1_elo": user_elo,
-        "player2_elo": bot["elo"],
-        "status": "active",
-        "winner_id": None,
-        "elo_change": 0,
-        "rounds": [],  # Store all rounds data
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow()
-    }
-    
-    in_memory_matches[match_id] = match_doc
-    # Save to database (check if exists first to avoid duplicate key error)
-    existing_match = await matches_collection.find_one({"_id": match_id})
-    if not existing_match:
-        await matches_collection.insert_one(match_doc.copy())
-    else:
-        # Update existing match
-        await matches_collection.update_one(
-            {"_id": match_id},
-            {"$set": match_doc}
-        )
-    
-    return {
-        "status": "matched",
-        "match_id": match_id,
-        "match_code": match_code,
-        "opponent": bot_name
-    }
+    return await _create_bot_match(user_id, user_elo)
 
 
 @app.post("/api/game/cancel")
@@ -1590,6 +1716,55 @@ async def cancel_matchmaking(current_user = Depends(get_current_user)):
     if was_queued:
         cancelled_users.add(user_id)
     return {"status": "cancelled"}
+
+
+# ============================================================================
+# Push Notifications API
+# ============================================================================
+
+@app.get("/api/notifications/vapid-public-key")
+async def get_vapid_public_key():
+    """Return the VAPID public key so client can subscribe with PushManager."""
+    return {"public_key": VAPID_PUBLIC_KEY}
+
+
+@app.post("/api/notifications/subscribe")
+async def subscribe_push_notifications(
+    payload: PushSubscriptionPayload,
+    current_user = Depends(get_current_user),
+):
+    """Store or update a user's push notification subscription."""
+    user_id = str(current_user["_id"])
+    doc = {
+        "endpoint": payload.endpoint,
+        "keys": payload.keys.dict(),
+        "user_id": user_id,
+        "updated_at": datetime.utcnow(),
+    }
+    await push_subscriptions_collection.update_one(
+        {"endpoint": payload.endpoint},
+        {
+            "$set": doc,
+            "$setOnInsert": {
+                "created_at": datetime.utcnow(),
+                "last_notified_at": None,
+            },
+        },
+        upsert=True,
+    )
+    return {"status": "subscribed"}
+
+
+@app.post("/api/notifications/unsubscribe")
+async def unsubscribe_push_notifications(
+    data: dict,
+    current_user = Depends(get_current_user),
+):
+    """Remove a push notification subscription."""
+    endpoint = data.get("endpoint")
+    if endpoint:
+        await push_subscriptions_collection.delete_one({"endpoint": endpoint})
+    return {"status": "unsubscribed"}
 
 
 @app.get("/api/game/active")
